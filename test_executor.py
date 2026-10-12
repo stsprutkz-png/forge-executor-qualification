@@ -52,6 +52,25 @@ class ExecutorTests(unittest.TestCase):
             fetched=child(self.root,'sha256:'+'0'*64,{'action':'FETCH','project_id':'csv-pilot','operation_id':r['operation_id']})
         self.assertEqual(fetched['sha256'],r['sha256'])
 
+    def test_watchdog_cleans_journal_owned_staging_without_claiming_success(self):
+        from executor import canonical, sha
+        import worker
+        t=task(seconds=1);payload=sha(canonical(t));op=sha(canonical([t['project_id'],t['task_id'],payload]))
+        with self.executor.db() as db:
+            db.execute('INSERT INTO operations VALUES(?,?,?,?,?,?,?,?)',
+                       (op,t['project_id'],t['task_id'],payload,canonical(t).decode(),'INTENT',time.time()+1,None))
+        stage=self.root/'staging'/op;stage.mkdir();(stage/'synthetic').write_text('residue')
+        stream=io.TextIOWrapper(io.BytesIO(canonical({'action':'SUBMIT','task':t})))
+        output=io.StringIO()
+        with patch.object(sys,'argv',['worker.py','--root',str(self.root),'--image','sha256:'+'0'*64]), \
+             patch.object(sys,'stdin',stream), patch.object(sys,'stdout',output), \
+             patch.object(worker,'command',side_effect=Fault('DEADLINE_EXCEEDED')), \
+             patch.object(PodmanBackend,'cleanup_operation'):
+            worker.main()
+        r=json.loads(output.getvalue())
+        self.assertEqual(r['status'],'OUTCOME_UNKNOWN');self.assertFalse(stage.exists())
+        self.assertIsNone(self.executor.head(t['project_id']))
+
     def test_identity_and_baseline_cannot_be_redirected(self):
         first=self.executor.submit(task())
         changed=task();changed['files']['README.md']='different'

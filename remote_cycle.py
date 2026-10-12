@@ -21,6 +21,7 @@ def run(image,output):
                          input=canonical(request),capture_output=True,timeout=130)
         if r.returncode:raise RuntimeError('WORKER_INTERFACE_FAILED')
         result=json.loads(r.stdout)
+        (output/'request-receipts.jsonl').open('a').write(json.dumps({k:v for k,v in result.items() if k!='artifact_base64'})+'\n')
         record={'action':request['action'],'request_sha256':sha(canonical(request)),
                 'elapsed_seconds':time.monotonic()-start,'status':result.get('status')}
         requests.append(record)
@@ -50,6 +51,7 @@ def run(image,output):
     scope=sha(str(state.resolve()).encode())
     timeout_op=sha(canonical([slow['project_id'],slow['task_id'],sha(canonical(slow))]))
     PodmanBackend(image,scope).cleanup_operation(timeout_op,Deadline(5))
+    assert not (state/'staging'/timeout_op).exists(), 'TIMEOUT_STAGING_REMAINS'
     # Real hard exit after durable verification, before SQLite project promotion.
     crash=task(project='crash-pilot',seconds=120)
     child_code='''import os,sys,json

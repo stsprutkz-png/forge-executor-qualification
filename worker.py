@@ -52,7 +52,12 @@ def main():
             result={'status':'OUTCOME_UNKNOWN' if op else 'FAILED','reason':str(exc)}
             if op:result['operation_id']=op
             if op:
-                try:PodmanBackend(args.image,sha(str(Path(args.root).resolve()).encode())).cleanup_operation(op,Deadline(3))
+                try:
+                    backend=PodmanBackend(args.image,sha(str(Path(args.root).resolve()).encode()))
+                    backend.cleanup_operation(op,Deadline(3))
+                    Executor(args.root,backend).cleanup(task['project_id'])
+                    if (Path(args.root)/'staging'/op).exists() or (Path(args.root)/'products'/(op+'.part')).exists():
+                        result['cleanup_status']='UNPROVEN'
                 except (Fault,OSError):result['cleanup_status']='UNPROVEN'
         print(json.dumps(result,ensure_ascii=False,sort_keys=True))
 
