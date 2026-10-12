@@ -1,4 +1,4 @@
-name: Adapter contract tests (no live LLM)
+name: Captured Qwen qualification (no model API calls)
 on:
   push:
     branches: [multimodel-stage1]
@@ -36,7 +36,7 @@ jobs:
       - name: Actual isolated worker cycle
         run: |
           image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
-          python3 llm_cycle.py --web-capture --image "$image_id" --root result > remote-cycle.log 2>&1
+          python3 llm_cycle.py --qwen-capture --image "$image_id" --root result > remote-cycle.log 2>&1
           cp runtime-profile.json result/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
