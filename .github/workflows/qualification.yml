@@ -1,0 +1,78 @@
+name: Independent executor qualification (public disposable host)
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  worker:
+    if: ${{ toJSON(github.event.repository.private) == 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require public dedicated repository
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: test "$REPO_PRIVATE" = "false"
+      - name: Set up rootless runtime (no production access)
+        run: bash setup_rootless.sh
+      - name: Control plane regressions
+        run: python3 -m unittest -v test_executor > control-tests.log 2>&1
+      - name: Actual isolated worker cycle
+        run: |
+          image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
+          python3 remote_cycle.py --image "$image_id" --output result > remote-cycle.log 2>&1
+          cp runtime-profile.json result/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: executor-result
+          path: result/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: executor-diagnostics
+          path: |
+            control-tests.log
+            remote-cycle.log
+            podman-host-info.json
+            runtime-profile.json
+          retention-days: 1
+  controller:
+    needs: worker
+    if: ${{ toJSON(github.event.repository.private) == 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: executor-result
+          path: received-one
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: executor-result
+          path: received-two
+      - name: Pin the identical runtime image
+        run: |
+          image_ref=$(python3 -c 'import json; print(json.load(open("received-one/runtime-profile.json"))["image_reference"])')
+          bash setup_rootless.sh "$image_ref"
+      - name: Verify received bytes and behavior on second host
+        run: |
+          image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
+          python3 verify_delivery.py --image "$image_id" --first received-one --second received-two > controller.log 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: controller-evidence
+          path: |
+            controller.log
+            received-one/delivery-controller.json
+          retention-days: 1
