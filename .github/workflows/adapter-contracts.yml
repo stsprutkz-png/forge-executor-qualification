@@ -1,0 +1,18 @@
+name: Adapter contract tests (no live LLM)
+on:
+  push:
+    branches: [multimodel-stage1]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    if: ${{ toJSON(github.event.repository.private) == 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Contract regressions, explicitly not a live model qualification
+        run: python3 -m unittest -v test_executor test_model_adapter
