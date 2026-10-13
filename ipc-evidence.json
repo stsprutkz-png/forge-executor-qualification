@@ -1,0 +1,25 @@
+{
+  "status": "PASS",
+  "scope": "real kernel SO_PEERCRED transport; not Core worker lifecycle",
+  "nss_stub": false,
+  "forgev2": {
+    "uid": 999,
+    "gid": 987
+  },
+  "denied": {
+    "status": "REJECTED",
+    "peer_pid": 2108,
+    "peer_uid": 0,
+    "peer_gid": 0,
+    "operation": "QUALIFY_READ_ONLY"
+  },
+  "allowed": {
+    "status": "PASS",
+    "peer_pid": 2109,
+    "peer_uid": 999,
+    "peer_gid": 987,
+    "operation": "QUALIFY_READ_ONLY"
+  },
+  "run_id": 38370450078,
+  "workflow_sha": "ed47b2ca8621df0e21c28aa3a4131adbb901c86a"
+}
