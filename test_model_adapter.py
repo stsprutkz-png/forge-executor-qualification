@@ -314,3 +314,19 @@ def run_offline_type_experiment(received,output,image):
     result={'status':'OFFLINE_COUNTERFACTUAL_BEHAVIOR_PASS' if all(x['ok'] for x in checks.values()) else 'OFFLINE_COUNTERFACTUAL_BEHAVIOR_FAIL','original_update_verdict':'NO-GO','original_schema_rejected':True,'strict_schema_after_single_key_removal':True,'checks':checks,'isolation':isolation,'summary_code_changed':code_changed,'history':history,'existing_state_unchanged':True,'raw_sha256':hashlib.sha256(raw).hexdigest(),'experimental_response_sha256':hashlib.sha256(adjusted.encode()).hexdigest(),'experimental_zip_sha256':hashlib.sha256((output/'experimental-candidate.zip').read_bytes()).hexdigest(),'paid_model_requests':0,'executor_submit_calls':0,'new_create':False,'update_applied':False,'full_lifecycle_pass':False}
     (output/'experiment.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
     return result
+
+class AuthorizedEnvelopeTests(unittest.TestCase):
+    def test_authorized_exact_envelope(self):
+        from model_adapter import normalize_recorded_update_envelope
+        files={'summary.py':'print(1)\n','README.md':'usage\n'}
+        raw=json.dumps({'type':'json_object','files':files});normalized,actual=normalize_recorded_update_envelope(raw)
+        self.assertEqual(actual,files);self.assertEqual(json.loads(normalized),{'files':files})
+        with self.assertRaises(ProviderFault):candidate(raw)
+    def test_reject_other_deviations(self):
+        from model_adapter import normalize_recorded_update_envelope
+        files={'summary.py':'print(1)','README.md':'usage'}
+        objects=[{'files':files},{'type':'text','files':files},{'type':'json_object','files':files,'status':'PASS'},{'type':None,'files':files},{'type':'json_object','files':[]},{'type':'json_object','files':{'summary.py':'code'}},{'type':'json_object','files':{**files,'other.py':'code'}},{'type':'json_object','files':{**files,'README.md':None}}]
+        for obj in objects:
+            with self.subTest(obj=obj),self.assertRaises(ProviderFault):normalize_recorded_update_envelope(json.dumps(obj))
+        for raw in ['{invalid','{"type":"text","type":"json_object","files":{}}','{"type":"json_object","files":{"summary.py":"a","summary.py":"b","README.md":"u"}}']:
+            with self.subTest(raw=raw),self.assertRaises(ProviderFault):normalize_recorded_update_envelope(raw)

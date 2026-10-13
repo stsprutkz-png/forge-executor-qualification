@@ -294,3 +294,60 @@ if __name__=='__main__':
     except (Fault,ValueError,OSError) as e:r={'status':'FAILED','reason':str(e),'llm_cycle_pass':False}
     print(json.dumps({k:v for k,v in r.items() if k not in ['receipts','create','update']}))
     raise SystemExit(0 if r['status'] in ('LIVE_MODEL_ISOLATED_CYCLE','CAPTURED_MODEL_ISOLATED_HOST_CYCLE','MODEL_REPAIR_CHECKED_ON_WORKER','UPDATE_CHECKED_ON_WORKER') else 2)
+
+
+def replay_authorized_update(root,image,received,fixed,acceptance):
+    """One recorded UPDATE only. No provider access, no new CREATE."""
+    import shutil,signal,socket
+    from unittest.mock import patch
+    from executor import canonical,normalize
+    from model_adapter import normalize_recorded_update_envelope
+    output=Path(root);output.mkdir(exist_ok=True);received=Path(received);fixed=Path(fixed)
+    raw=(received/'raw-model-content.txt').read_bytes()
+    assert sha(raw)=='4df3329b3818f9a268c83923dd929277349d692e6ae49fbb9cbe0ffa004dcb44'
+    receipt=json.loads((received/'update-api-audit.json').read_text())
+    assert receipt['real_post_attempts']==1 and receipt['provider_receipt']['provenance']=='LIVE_PROVIDER_API' and receipt['schema_status']=='REJECTED' and receipt['update_status']=='NOT_APPLIED'
+    proof=json.loads(Path(acceptance).read_text());assert proof['status']=='INDEPENDENT_REPAIRED_CREATE_DELIVERY_VERIFIED' and proof['checks']['ok']
+    baseline=(received/'baseline-product.zip').read_bytes();assert sha(baseline)==sha((fixed/'product.zip').read_bytes())==proof['product_sha256']=='634c9205351c84736e6af8b1d0c7301c239380d8014f39349f7d6d36db5aa17d'
+    # Immutable raw and baseline archived before any application.
+    (output/'raw-model-content.txt').write_bytes(raw);(output/'baseline-product.zip').write_bytes(baseline)
+    (output/'original-api-audit.json').write_bytes((received/'update-api-audit.json').read_bytes())
+    adjusted,files=normalize_recorded_update_envelope(raw.decode('utf-8'))
+    assert files==json.loads(raw)['files']
+    (output/'model-response.json').write_text(adjusted)
+    ledger={'source_run_id':38381781297,'source_execution_sha':'88ea3277ae70fa75820284f05bef43315ddf8b1b','source_provider':'deepseek','source_response_id':receipt['provider_receipt']['response_id'],'original_verdict':'NO-GO','normalization_reason':'OWNER_AUTHORIZED_EXACT_FILES_TYPE_JSON_OBJECT_ENVELOPE','removed_root_key':'type','removed_value':'json_object','raw_sha256':sha(raw),'normalized_sha256':sha(adjusted.encode()),'file_sha256':{n:sha(s.encode())for n,s in files.items()},'file_bytes_unchanged':True,'new_model_requests':0}
+    (output/'normalization.json').write_text(json.dumps(ledger,indent=2))
+    state=output/'state';shutil.copytree(received/'state',state)
+    executor=Executor(state,PodmanBackend(image,sha(str(state.resolve()).encode())))
+    spec=json.loads((fixed/'update-plan.json').read_text())['spec']
+    assert spec['project_id']=='llm-csv-pilot' and spec['mode']=='UPDATE' and spec['task_id']=='update-1' and spec['oracle_version']=='csv-v2'
+    assert executor.head(spec['project_id'])['sha256']==spec['base_sha256']==sha(baseline)
+    before=executor._archive(received/'baseline-product.zip',sha(baseline));assert before['summary.py']!=files['summary.py'].encode()
+    task=normalize({k:v for k,v in {**spec,'request':'Extend existing verified CSV product with category totals; preserve exact sums','files':files}.items()if k!='baseline_files'})
+    (output/'update-task.json').write_bytes(canonical(task))
+    def abort(*unused):raise Fault('GLOBAL_REPLAY_TIMEOUT')
+    signal.signal(signal.SIGALRM,abort);signal.alarm(240)
+    try:
+        with patch('socket.create_connection',side_effect=AssertionError('NO_PROVIDER_NETWORK')),patch('socket.socket.connect',side_effect=AssertionError('NO_PROVIDER_NETWORK')),patch('model_adapter.http_complete',side_effect=AssertionError('NO_API')):
+            r=executor.submit(task)
+            (output/'application-result.json').write_text(json.dumps({k:v for k,v in r.items()if k!='artifact_base64'},indent=2))
+            if r.get('status')!='VERIFIED_ARTIFACT':raise Fault('UPDATE_BEHAVIOR_FAILED')
+            repeated=executor.submit(task);assert repeated['reused'] and repeated['sha256']==r['sha256']
+            # Actual independent executor Products storage and public FETCH interface.
+            request={'action':'FETCH','project_id':task['project_id'],'operation_id':r['operation_id']}
+            (output/'fetch-request.json').write_bytes(canonical(request))
+            import subprocess,sys
+            downloads=[]
+            for index in [1,2]:
+                run=subprocess.run([sys.executable,'worker.py','--root',str(state),'--image',image],input=canonical(request),capture_output=True,timeout=15,check=True)
+                assert len(run.stdout)<=8*1024*1024
+                got=json.loads(run.stdout);assert got['status']=='VERIFIED_ARTIFACT' and got['sha256']==r['sha256']
+                data=base64.b64decode(got.pop('artifact_base64'));assert sha(data)==r['sha256'];downloads.append(data)
+                (output/f'fetch-{index}.json').write_text(json.dumps(got,indent=2))
+            assert downloads[0]==downloads[1]
+            (output/'product.zip').write_bytes(downloads[0])
+            assert executor._archive(output/'product.zip',r['sha256'])=={n:s.encode()for n,s in files.items()}
+            assert executor._archive(received/'baseline-product.zip',sha(baseline))==before
+            result={'status':'RECORDED_UPDATE_APPLIED_AND_PRODUCTS_FETCHED','base_sha256':sha(baseline),'product_sha256':r['sha256'],'executor':{k:v for k,v in r.items()if k!='artifact_base64'},'new_model_requests':0,'new_create_called':False,'executor_reused':True,'fetched_twice_equal':True,'products_delivery_route':'executor/state/products -> worker.py FETCH -> GitHub artifact -> second VM','original_update_verdict':'NO-GO','normalization':ledger,'qualification_pass':False}
+            (output/'update-evidence.json').write_text(json.dumps(result,indent=2));return result
+    finally:signal.alarm(0)

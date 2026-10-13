@@ -184,3 +184,22 @@ class Adapter:
                 db.execute('UPDATE jobs SET phase=?,result=? WHERE project=? AND taskid=?',('BLOCKED',canonical(result).decode(),spec['project_id'],spec['task_id']));db.commit()
                 return result
             finally:db.close();fcntl.flock(lock,fcntl.LOCK_UN)
+
+
+def normalize_recorded_update_envelope(raw):
+    """Explicit owner-authorized recorded-response envelope, not generic tolerance."""
+    if not isinstance(raw,str) or len(raw.encode('utf-8'))>65536:raise ProviderFault('RECORDED_ENVELOPE_REJECTED',{'violation':'content_limit_or_type'})
+    def unique(pairs):
+        out={}
+        for k,v in pairs:
+            if k in out:raise ValueError('duplicate_key')
+            out[k]=v
+        return out
+    try:obj=json.loads(raw,object_pairs_hook=unique,parse_constant=lambda s:(_ for _ in ()).throw(ValueError('nonfinite_json')))
+    except ValueError as e:raise ProviderFault('RECORDED_ENVELOPE_REJECTED',{'violation':'invalid_or_duplicate_json'}) from e
+    if not isinstance(obj,dict) or set(obj)!={'files','type'} or obj['type']!='json_object':
+        raise ProviderFault('RECORDED_ENVELOPE_REJECTED',{'violation':'exact_recorded_envelope_required'})
+    adjusted=json.dumps({'files':obj['files']},ensure_ascii=False)
+    files=candidate(adjusted)
+    if set(files)!={'summary.py','README.md'}:raise ProviderFault('RECORDED_ENVELOPE_REJECTED',{'violation':'exact_update_files_required'})
+    return adjusted,files
