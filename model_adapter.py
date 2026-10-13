@@ -105,7 +105,9 @@ def http_complete(provider,model,text,deadline,audit=None,content_path=None):
         raise ProviderFault('PROVIDER_HTTP_'+str(e.code)) from None
     except (urllib.error.URLError,TimeoutError,OSError):
         if event['http_status']!='RESPONSE_RECEIVED':event['http_status']='OUTCOME_UNKNOWN'
-        emit();raise ProviderFault('PROVIDER_OUTCOME_UNKNOWN') from None
+        emit()
+        code='PROVIDER_RESPONSE_READ_FAILED' if event['http_status']=='RESPONSE_RECEIVED' else 'PROVIDER_OUTCOME_UNKNOWN'
+        raise ProviderFault(code) from None
     if len(raw)>262144:raise ProviderFault('PROVIDER_RESPONSE_LIMIT',{'violation':'provider_envelope_size'})
     try:
         v=json.loads(raw);choice=v['choices'][0];content=choice['message']['content'];usage=v.get('usage',{})

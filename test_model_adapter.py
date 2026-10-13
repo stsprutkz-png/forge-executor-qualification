@@ -225,3 +225,19 @@ class AuditDiagnosticsTests(unittest.TestCase):
             safe_content_snapshot(p,'{"password":"SYNTHETIC_PASSWORD_VALUE","api_key":"SYNTHETIC_KEY_VALUE"}')
             self.assertNotIn('SYNTHETIC_PASSWORD_VALUE',p.read_text());self.assertNotIn('SYNTHETIC_KEY_VALUE',p.read_text())
             self.assertEqual(stat.S_IMODE(p.stat().st_mode),0o600)
+    def test_body_read_failure_does_not_erase_http_response(self):
+        import os
+        from unittest.mock import patch
+        from model_adapter import http_complete,ProviderFault
+        from processes import Deadline
+        class Response:
+            status=200
+            def __enter__(self):return self
+            def __exit__(self,*a):pass
+            def read(self,*a):raise TimeoutError('synthetic body timeout')
+        class Fake:
+            def open(self,*a,**kw):return Response()
+        events=[]
+        with patch.dict(os.environ,{'DEEPSEEK_API_KEY':'SYNTHETIC_LOCAL_SECRET_VALUE'}),patch('urllib.request.build_opener',return_value=Fake()):
+            with self.assertRaisesRegex(ProviderFault,'RESPONSE_READ_FAILED'):http_complete('deepseek','deepseek-flash','synthetic',Deadline(30),events.append)
+        self.assertEqual(events[-1]['http_status'],'RESPONSE_RECEIVED');self.assertEqual(events[-1]['schema_status'],'NOT_RUN')
