@@ -1,7 +1,6 @@
 name: Pilot 3 authorized single existing-project UPDATE
 on:
-  push:
-    branches: [multimodel-pilot3-update]
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read
