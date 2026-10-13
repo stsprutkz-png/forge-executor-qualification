@@ -241,3 +241,76 @@ class AuditDiagnosticsTests(unittest.TestCase):
         with patch.dict(os.environ,{'DEEPSEEK_API_KEY':'SYNTHETIC_LOCAL_SECRET_VALUE'}),patch('urllib.request.build_opener',return_value=Fake()):
             with self.assertRaisesRegex(ProviderFault,'RESPONSE_READ_FAILED'):http_complete('deepseek','deepseek-flash','synthetic',Deadline(30),events.append)
         self.assertEqual(events[-1]['http_status'],'RESPONSE_RECEIVED');self.assertEqual(events[-1]['schema_status'],'NOT_RUN')
+
+# Offline diagnostic experiment ONLY. This is not adapter normalization.
+def diagnostic_remove_type(raw):
+    def unique(pairs):
+        out={}
+        for k,v in pairs:
+            if k in out:raise ValueError('duplicate_key')
+            out[k]=v
+        return out
+    obj=json.loads(raw,object_pairs_hook=unique)
+    if not isinstance(obj,dict) or set(obj)!={'type','files'} or obj['type']!='json_object':
+        raise ValueError('experiment_requires_exact_type_and_files')
+    adjusted=json.dumps({'files':obj['files']},ensure_ascii=False)
+    candidate(adjusted) # unchanged strict production schema
+    return adjusted
+
+class OfflineTypeRegressionTests(unittest.TestCase):
+    def raw(self,**extra):return json.dumps({'files':{'summary.py':'print(1)','README.md':'usage'},**extra})
+    def test_valid_strict(self):self.assertEqual(set(candidate(self.raw())),{'summary.py','README.md'})
+    def test_original_stays_rejected(self):
+        with self.assertRaises(ProviderFault):candidate(self.raw(type='json_object'))
+    def test_only_exact_service_key_removed(self):
+        raw=self.raw(type='json_object');before=json.loads(raw)
+        self.assertEqual(json.loads(diagnostic_remove_type(raw)),{'files':before['files']})
+        self.assertEqual(json.loads(raw),before)
+    def test_arbitrary_extra_key_rejected(self):
+        with self.assertRaises(ValueError):diagnostic_remove_type(self.raw(type='json_object',other=1))
+    def test_wrong_type_rejected(self):
+        for val in ['text',None,1,{'type':'json_object'}]:
+            with self.assertRaises(ValueError):diagnostic_remove_type(self.raw(type=val))
+    def test_duplicate_keys_rejected(self):
+        with self.assertRaises(ValueError):diagnostic_remove_type('{"type":"text","type":"json_object","files":{}}')
+    def test_bad_files_rejected(self):
+        for files in [[],{}, {'summary.py':1},{'summary.py':'code','../escape':'bad'}]:
+            with self.assertRaises(ProviderFault):diagnostic_remove_type(json.dumps({'type':'json_object','files':files}))
+    def test_invalid_json_rejected(self):
+        with self.assertRaises(ValueError):diagnostic_remove_type('{invalid')
+
+
+def run_offline_type_experiment(received,output,image):
+    import hashlib,sqlite3,socket,zipfile
+    from isolation import PodmanBackend
+    from contracts import verify
+    received=Path(received);output=Path(output);output.mkdir(exist_ok=True)
+    raw=(received/'raw-model-content.txt').read_bytes()
+    assert hashlib.sha256(raw).hexdigest()=='4df3329b3818f9a268c83923dd929277349d692e6ae49fbb9cbe0ffa004dcb44'
+    original=json.loads(raw);adjusted=diagnostic_remove_type(raw.decode());files=candidate(adjusted)
+    assert original['files']==files
+    # Baseline state is read-only, never sent to submit().
+    state=received/'state/state.sqlite3';state_before=hashlib.sha256(state.read_bytes()).hexdigest()
+    db=sqlite3.connect('file:'+str(state.resolve())+'?mode=ro',uri=True)
+    history=db.execute('select task_id,phase from operations order by rowid').fetchall();db.close()
+    assert history==[('create-1','FAILED'),('create-1-repair-1','COMPLETE')]
+    checks={}
+    with patch('socket.create_connection',side_effect=AssertionError('NO_API_NETWORK')),patch('socket.socket.connect',side_effect=AssertionError('NO_API_NETWORK')),patch('model_adapter.http_complete',side_effect=AssertionError('NO_MODEL_REQUEST')):
+        with tempfile.TemporaryDirectory() as tmp:
+            from executor import sha
+            backend=PodmanBackend(image,sha(tmp.encode()));executor=Executor(Path(tmp)/'diagnostic-state',backend)
+            deadline=Deadline(120);backend.begin('0'*64,deadline);isolation=backend.preflight(deadline)
+            baseline=Path(tmp)/'baseline';executor._write_files(baseline,executor._archive(received/'baseline-product.zip','634c9205351c84736e6af8b1d0c7301c239380d8014f39349f7d6d36db5aa17d'))
+            candidate_dir=Path(tmp)/'candidate';executor._write_files(candidate_dir,files)
+            checks['baseline']=verify(baseline,'csv-v1',backend,deadline)
+            checks['experimental_candidate']=verify(candidate_dir,'csv-v2',backend,deadline)
+            assert (candidate_dir/'summary.py').read_bytes()==original['files']['summary.py'].encode()
+            code_changed=(baseline/'summary.py').read_bytes()!=(candidate_dir/'summary.py').read_bytes()
+    assert hashlib.sha256(state.read_bytes()).hexdigest()==state_before
+    (output/'original-raw.txt').write_bytes(raw);(output/'experimental-response.json').write_text(adjusted)
+    # Diagnostic export, never published as updated product.
+    with zipfile.ZipFile(output/'experimental-candidate.zip','w',zipfile.ZIP_DEFLATED) as z:
+        for name,source in sorted(files.items()):z.writestr(name,source.encode())
+    result={'status':'OFFLINE_COUNTERFACTUAL_BEHAVIOR_PASS' if all(x['ok'] for x in checks.values()) else 'OFFLINE_COUNTERFACTUAL_BEHAVIOR_FAIL','original_update_verdict':'NO-GO','original_schema_rejected':True,'strict_schema_after_single_key_removal':True,'checks':checks,'isolation':isolation,'summary_code_changed':code_changed,'history':history,'existing_state_unchanged':True,'raw_sha256':hashlib.sha256(raw).hexdigest(),'experimental_response_sha256':hashlib.sha256(adjusted.encode()).hexdigest(),'experimental_zip_sha256':hashlib.sha256((output/'experimental-candidate.zip').read_bytes()).hexdigest(),'paid_model_requests':0,'executor_submit_calls':0,'new_create':False,'update_applied':False,'full_lifecycle_pass':False}
+    (output/'experiment.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+    return result

@@ -1,52 +1,12 @@
-name: Pilot 3 final single UPDATE with repaired diagnostics
+name: Free rejected UPDATE counterfactual diagnostic
 on:
   push:
-    branches: [multimodel-update-final]
+    branches: [multimodel-update-offline-diagnostic]
 permissions:
   contents: read
   actions: read
 jobs:
-  update-worker:
-    environment: forge-api-pilot
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: repaired-create
-          run-id: 38373418459
-          github-token: ${{ github.token }}
-          path: received
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: repaired-create-controller
-          run-id: 38373418459
-          github-token: ${{ github.token }}
-          path: acceptance
-      - name: Same isolated runtime without provider credentials
-        run: |
-          image_ref=$(python3 -c 'import json; print(json.load(open("received/runtime-profile.json"))["image_reference"])')
-          bash setup_rootless.sh "$image_ref"
-          mkdir -p result
-          cp runtime-profile.json result/
-      - name: One authorized UPDATE request; no CREATE and no retries
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: |
-          image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
-          python3 llm_cycle.py --update-from received --acceptance-from acceptance/delivery-controller.json --root result --image "$image_id" > result/update.log 2>&1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: updated-product
-          path: result/
-          retention-days: 1
-          if-no-files-found: error
-  independent-lifecycle:
-    needs: update-worker
+  independent-offline-oracle:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -56,54 +16,32 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: updated-product
-          path: received-one
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: updated-product
-          path: received-two
-      - name: Same isolated runtime on independent host
+          run-id: 38381781297
+          github-token: ${{ github.token }}
+          path: received
+      - name: Targeted free schema regressions
         run: |
-          image_ref=$(python3 -c 'import json; print(json.load(open("received-one/runtime-profile.json"))["image_reference"])')
+          mkdir result
+          python3 -m unittest -v test_model_adapter.OfflineTypeRegressionTests > result/schema-tests.log 2>&1
+      - name: Rootless runtime without environment secrets
+        run: |
+          image_ref=$(python3 -c 'import json; print(json.load(open("received/runtime-profile.json"))["image_reference"])')
           bash setup_rootless.sh "$image_ref"
-      - name: Independent before after behavior and final ZIP delivery
+          cp runtime-profile.json result/
+      - name: Counterfactual isolated behavior; no submit and no provider requests
         run: |
-          python3 - <<'PY'
-          import json,tempfile,sqlite3
+          python3 - <<'PY' > result/oracle.log 2>&1
+          import json
           from pathlib import Path
-          from executor import Executor,sha
-          from isolation import PodmanBackend
-          from contracts import verify
-          from processes import Deadline
-          one=Path('received-one');two=Path('received-two')
-          metadata=json.loads((one/'update-evidence.json').read_text())
-          data=(one/'product.zip').read_bytes()
-          assert data==(two/'product.zip').read_bytes() and sha(data)==metadata['product_sha256']
+          from test_model_adapter import run_offline_type_experiment
           image=json.loads(Path('runtime-profile.json').read_text())['image_id']
-          outcomes={}
-          with tempfile.TemporaryDirectory() as tmp:
-              backend=PodmanBackend(image,sha(tmp.encode()));executor=Executor(Path(tmp)/'state',backend)
-              deadline=Deadline(120);backend.begin('0'*64,deadline);isolation=backend.preflight(deadline)
-              for mode,archive,version,expected_sha in [('CREATE','baseline-product.zip','csv-v1',metadata['base_sha256']),('UPDATE','product.zip','csv-v2',metadata['product_sha256'])]:
-                  workspace=Path(tmp)/mode
-                  executor._write_files(workspace,executor._archive(one/archive,expected_sha))
-                  checks=verify(workspace,version,backend,deadline);assert checks['ok']
-                  outcomes[mode]=checks
-                  if mode=='UPDATE':
-                      raw=json.loads((one/'model-response.json').read_text())
-                      for name,source in raw['files'].items():assert (workspace/name).read_bytes()==source.encode()
-              before=outcomes['CREATE']['cases'][1]['actual'];after=outcomes['UPDATE']['cases'][1]['actual']
-              assert 'categories' not in before and after['categories']=={'A':'12.50','B':'-3'}
-              assert before['rows']==after['rows']==3 and before['total']==after['total']=='9.50'
-              for mode in ['CREATE','UPDATE']:assert outcomes[mode]['cases'][6]['actual']['total']=='123456789012345678901234567890.1'
-          db=sqlite3.connect('file:'+str((one/'state/state.sqlite3').resolve())+'?mode=ro',uri=True)
-          history=db.execute('SELECT task_id,phase FROM operations ORDER BY rowid').fetchall();db.close()
-          assert history==[('create-1','FAILED'),('create-1-repair-1','COMPLETE'),('update-1','COMPLETE')]
-          result={'status':'INDEPENDENT_LIFECYCLE_AND_DELIVERY_VERIFIED','provider_attested_externally':False,'checks':outcomes,'isolation':isolation,'functional_delta':{'before':before,'after':after},'history':history,'base_sha256':metadata['base_sha256'],'product_sha256':sha(data),'downloaded_twice_equal':True,'model_requests':0}
-          Path('delivery-controller.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+          r=run_offline_type_experiment('received','result',image)
+          assert r['status']=='OFFLINE_COUNTERFACTUAL_BEHAVIOR_PASS'
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: lifecycle-controller
-          path: delivery-controller.json
+          name: offline-update-diagnostic
+          path: result/
           retention-days: 1
+          if-no-files-found: error
