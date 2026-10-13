@@ -216,3 +216,12 @@ class AuditDiagnosticsTests(unittest.TestCase):
             content=json.dumps({'files':{'summary.py':'# synthetic'}})
             result=self.invoke(content,p,events,usage=['wrong type'])
             self.assertEqual(result['usage'],{});self.assertEqual(p.read_text(),content)
+    def test_labelled_secret_and_existing_file_permissions(self):
+        import tempfile,stat
+        from pathlib import Path
+        from model_adapter import safe_content_snapshot
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'raw';p.write_text('old');p.chmod(0o644)
+            safe_content_snapshot(p,'{"password":"SYNTHETIC_PASSWORD_VALUE","api_key":"SYNTHETIC_KEY_VALUE"}')
+            self.assertNotIn('SYNTHETIC_PASSWORD_VALUE',p.read_text());self.assertNotIn('SYNTHETIC_KEY_VALUE',p.read_text())
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode),0o600)

@@ -28,6 +28,7 @@ def redact(value):
     text=re.sub(r'-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)','[REDACTED PRIVATE KEY]',text)
     text=re.sub(r'(?:sk-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]{16,}','[REDACTED TOKEN]',text)
     text=re.sub(r'(?i)(bearer\s+)[^\s"\x27]+',r'\1[REDACTED]',text)
+    text=re.sub(r'''(?i)(["']?(?:password|api[_-]?key|access[_-]?token|secret|authorization)["']?\s*[:=]\s*["'])[^"']*(["'])''',r'\1[REDACTED]\2',text)
     return text
 
 def safe_content_snapshot(path,content):
@@ -35,6 +36,7 @@ def safe_content_snapshot(path,content):
     text=redact(content);data=text.encode();limit=65536
     bounded=data[:limit].decode('utf-8',errors='ignore').encode()
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
+    os.fchmod(fd,0o600)
     with os.fdopen(fd,'wb') as f:f.write(bounded);f.flush();os.fsync(f.fileno())
     return {'path':path.name,'content_type':type(content).__name__,'original_bytes':len(content.encode()) if isinstance(content,str) else None,'saved_bytes':len(bounded),'truncated':len(data)>limit,'redacted':text!=content,'saved_sha256':sha(bounded)}
 
