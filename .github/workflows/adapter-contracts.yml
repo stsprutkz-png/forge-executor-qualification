@@ -1,7 +1,6 @@
 name: Single authorized live API pilot
 on:
-  push:
-    branches: [multimodel-stage1]
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:

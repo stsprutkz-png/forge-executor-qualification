@@ -52,7 +52,7 @@ def prompt(spec):
               'No networking, external dependencies, subprocesses, credentials or PASS markers. ')
     if version=='csv-v2':contract+='Also include categories: sorted mapping of category (empty if absent) to exact Decimal total strings. '
     if spec['mode']=='UPDATE':contract+='Update the supplied verified baseline, preserving previous behavior. '
-    return contract+'Return exactly JSON {"files":{"summary.py":"complete source","README.md":"usage"}}; no fences or extra keys.\nVERIFIED SYNTHETIC BASELINE:\n'+json.dumps(base,sort_keys=True)
+    return contract+'Return one JSON object with only the key files. The files mapping must contain summary.py with the entire executable Python source and README.md with actual usage instructions. Generate the implementation: do not return labels such as complete source or usage as file contents. No fences or extra keys.\nVERIFIED SYNTHETIC BASELINE:\n'+json.dumps(base,sort_keys=True)
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args):return None
