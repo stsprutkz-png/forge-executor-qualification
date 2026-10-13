@@ -1,7 +1,6 @@
 name: Pilot 3 one DeepSeek repair from independent oracle
 on:
-  push:
-    branches: [multimodel-api-pilot3]
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read
