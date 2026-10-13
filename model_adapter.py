@@ -18,23 +18,47 @@ ENDPOINTS={'deepseek':('https://api.deepseek.com/chat/completions','DEEPSEEK_API
 SECRET=re.compile(r'-----BEGIN .*PRIVATE KEY|(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{16,}')
 
 class ProviderFault(Fault):
-    pass
+    def __init__(self,code,detail=None):
+        super().__init__(code);self.detail=detail or {}
+
+def redact(value):
+    text=value if isinstance(value,str) else json.dumps(value,ensure_ascii=False,default=lambda unused:'[UNSERIALIZABLE]')
+    keys=[os.environ.get(env) for _,env in ENDPOINTS.values()]
+    for key in sorted((k for k in keys if k),key=len,reverse=True):text=text.replace(key,'[REDACTED]')
+    text=re.sub(r'-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)','[REDACTED PRIVATE KEY]',text)
+    text=re.sub(r'(?:sk-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]{16,}','[REDACTED TOKEN]',text)
+    text=re.sub(r'(?i)(bearer\s+)[^\s"\x27]+',r'\1[REDACTED]',text)
+    return text
+
+def safe_content_snapshot(path,content):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    text=redact(content);data=text.encode();limit=65536
+    bounded=data[:limit].decode('utf-8',errors='ignore').encode()
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as f:f.write(bounded);f.flush();os.fsync(f.fileno())
+    return {'path':path.name,'content_type':type(content).__name__,'original_bytes':len(content.encode()) if isinstance(content,str) else None,'saved_bytes':len(bounded),'truncated':len(data)>limit,'redacted':text!=content,'saved_sha256':sha(bounded)}
 
 def candidate(raw):
-    if not isinstance(raw,str) or len(raw.encode())>65536:raise ProviderFault('MODEL_OUTPUT_LIMIT')
-    if SECRET.search(raw):raise ProviderFault('MODEL_SECRET_REJECTED')
+    if not isinstance(raw,str):raise ProviderFault('MODEL_SCHEMA_INVALID',{'violation':'content_type','actual_type':type(raw).__name__})
+    if len(raw.encode())>65536:raise ProviderFault('MODEL_OUTPUT_LIMIT',{'violation':'content_size','max_bytes':65536})
+    if SECRET.search(raw) or any(os.environ.get(env) and os.environ[env] in raw for _,env in ENDPOINTS.values()):raise ProviderFault('MODEL_SECRET_REJECTED',{'violation':'secret_detected'})
     def pairs(items):
         d={}
         for k,v in items:
-            if k in d:raise ProviderFault('MODEL_DUPLICATE_KEY')
+            if k in d:raise ProviderFault('MODEL_DUPLICATE_KEY',{'violation':'duplicate_key','key':redact(k)[:200]})
             d[k]=v
         return d
-    try:v=json.loads(raw,object_pairs_hook=pairs)
-    except (ValueError,TypeError):raise ProviderFault('MODEL_JSON_INVALID') from None
-    if not isinstance(v,dict) or set(v)!={'files'} or not isinstance(v['files'],dict):raise ProviderFault('MODEL_SCHEMA_INVALID')
-    if not v['files'] or set(v['files'])-{'summary.py','README.md'} or 'summary.py' not in v['files']:
-        raise ProviderFault('MODEL_FILES_OUTSIDE_CONTRACT')
-    if any(not isinstance(x,str) for x in v['files'].values()):raise ProviderFault('MODEL_FILES_INVALID')
+    def invalid_constant(unused):raise ProviderFault('MODEL_JSON_INVALID',{'violation':'nonfinite_json_constant'})
+    try:v=json.loads(raw,object_pairs_hook=pairs,parse_constant=invalid_constant)
+    except json.JSONDecodeError as e:raise ProviderFault('MODEL_JSON_INVALID',{'violation':'json_syntax','line':e.lineno,'column':e.colno,'offset':e.pos}) from None
+    if not isinstance(v,dict):raise ProviderFault('MODEL_SCHEMA_INVALID',{'violation':'root_type','actual_type':type(v).__name__})
+    if set(v)!={'files'}:raise ProviderFault('MODEL_SCHEMA_INVALID',{'violation':'root_keys','actual_keys':[redact(k)[:200] for k in sorted(v)][:50],'required_keys':['files']})
+    if not isinstance(v['files'],dict):raise ProviderFault('MODEL_SCHEMA_INVALID',{'violation':'files_type','actual_type':type(v['files']).__name__})
+    missing={'summary.py'}-set(v['files']);outside=set(v['files'])-{'summary.py','README.md'}
+    if missing:raise ProviderFault('MODEL_FILES_OUTSIDE_CONTRACT',{'violation':'missing_required_files','files':sorted(missing)})
+    if outside:raise ProviderFault('MODEL_FILES_OUTSIDE_CONTRACT',{'violation':'files_outside_contract','files':[redact(k)[:200] for k in sorted(outside)][:50]})
+    bad=[{'file':k,'actual_type':type(x).__name__} for k,x in v['files'].items() if not isinstance(x,str)]
+    if bad:raise ProviderFault('MODEL_FILES_INVALID',{'violation':'file_content_type','files':bad})
     return v['files']
 
 def prompt(spec):
@@ -57,41 +81,49 @@ def prompt(spec):
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args):return None
 
-def http_complete(provider,model,text,deadline,audit=None):
+def http_complete(provider,model,text,deadline,audit=None,content_path=None):
     if provider not in ENDPOINTS or not isinstance(model,str) or not model.strip():raise ProviderFault('PROVIDER_CONFIG_INVALID')
     url,env=ENDPOINTS[provider];key=os.environ.get(env)
     if not key:raise ProviderFault('PROVIDER_CREDENTIAL_MISSING')
     if key in text:raise ProviderFault('PROMPT_SECRET_REJECTED')
-    body={'model':model,'messages':[{'role':'user','content':text}],'max_tokens':2048,
-          'stream':False,'response_format':{'type':'json_object'}}
+    body={'model':model,'messages':[{'role':'user','content':text}],'max_tokens':2048,'stream':False,'response_format':{'type':'json_object'}}
     if len(text.encode())>8192:raise ProviderFault('PROVIDER_INPUT_LIMIT')
     if provider=='deepseek':body['thinking']={'type':'disabled'}
     if provider=='openrouter':body['provider']={'require_parameters':True,'allow_fallbacks':False}
     request=urllib.request.Request(url,data=canonical(body),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},method='POST')
-    started=time.monotonic()
+    started=time.monotonic();event={'http_status':'NOT_SENT','schema_status':'NOT_RUN'}
+    def emit():
+        if audit:audit(dict(event))
     try:
         with urllib.request.build_opener(NoRedirect()).open(request,timeout=min(30,deadline.remaining())) as r:
+            event.update(http_status='RESPONSE_RECEIVED',http_code=getattr(r,'status',200));emit()
             raw=r.read(262145)
-    except urllib.error.HTTPError as e:raise ProviderFault('PROVIDER_HTTP_'+str(e.code)) from None
-    except (urllib.error.URLError,TimeoutError,OSError):raise ProviderFault('PROVIDER_OUTCOME_UNKNOWN') from None
-    deadline.remaining()
-    if len(raw)>262144:raise ProviderFault('PROVIDER_RESPONSE_LIMIT')
+    except urllib.error.HTTPError as e:
+        event.update(http_status='RESPONSE_RECEIVED',http_code=e.code);emit()
+        raise ProviderFault('PROVIDER_HTTP_'+str(e.code)) from None
+    except (urllib.error.URLError,TimeoutError,OSError):
+        if event['http_status']!='RESPONSE_RECEIVED':event['http_status']='OUTCOME_UNKNOWN'
+        emit();raise ProviderFault('PROVIDER_OUTCOME_UNKNOWN') from None
+    if len(raw)>262144:raise ProviderFault('PROVIDER_RESPONSE_LIMIT',{'violation':'provider_envelope_size'})
     try:
-        v=json.loads(raw);choice=v['choices'][0]
-        content=choice['message']['content'];usage=v.get('usage',{})
-        if key in content:raise ProviderFault('MODEL_SECRET_REJECTED')
-    except (KeyError,TypeError,ValueError,IndexError):raise ProviderFault('PROVIDER_RESPONSE_INVALID') from None
-    # Whitelist metadata; never persist headers, arbitrary error bodies or reasoning.
-    response_id=str(v.get('id',''))[:200];returned_model=str(v.get('model',model))[:200]
-    if any(key in x or SECRET.search(x) for x in [response_id,returned_model]):raise ProviderFault('MODEL_SECRET_REJECTED')
-    safe_usage={k:x for k,x in usage.items() if k in ('prompt_tokens','completion_tokens','total_tokens','cost','prompt_cache_hit_tokens','prompt_cache_miss_tokens') and isinstance(x,(int,float)) and not isinstance(x,bool) and math.isfinite(x) and x>=0}
-    safe={'response_id':response_id,'provider':provider,'model':returned_model,'usage':safe_usage,'elapsed_seconds':time.monotonic()-started,'provenance':'LIVE_PROVIDER_API','cost_usd_observed':safe_usage.get('cost') if provider=='openrouter' else None}
-    if audit:audit(safe)
-    if choice['finish_reason']!='stop' or choice['message'].get('tool_calls'):raise ProviderFault('PROVIDER_COMPLETION_INCOMPLETE')
-    candidate(content)
-    return {'content':content,'response_id':response_id,'provider':provider,'model':returned_model,
-            'usage':safe_usage,'elapsed_seconds':time.monotonic()-started,'provenance':'LIVE_PROVIDER_API',
-            'cost_usd_observed':safe_usage.get('cost') if provider=='openrouter' else None}
+        v=json.loads(raw);choice=v['choices'][0];content=choice['message']['content'];usage=v.get('usage',{})
+    except (KeyError,TypeError,ValueError,IndexError):
+        event.update(schema_status='ENVELOPE_REJECTED',schema_error={'violation':'provider_envelope_invalid'});emit()
+        raise ProviderFault('PROVIDER_RESPONSE_INVALID') from None
+    # Save sanitized raw model content BEFORE deadline/completion/schema rejection.
+    if content_path:event['content_snapshot']=safe_content_snapshot(content_path,content)
+    event.update(response_id=redact(str(v.get('id','')))[:200],provider=provider,model=redact(str(v.get('model',model)))[:200],
+                 usage={k:x for k,x in (usage.items() if isinstance(usage,dict) else []) if k in ('prompt_tokens','completion_tokens','total_tokens','cost','prompt_cache_hit_tokens','prompt_cache_miss_tokens') and isinstance(x,(int,float)) and not isinstance(x,bool) and math.isfinite(x) and x>=0},
+                 elapsed_seconds=time.monotonic()-started,provenance='LIVE_PROVIDER_API')
+    event['cost_usd_observed']=event['usage'].get('cost') if provider=='openrouter' else None;emit()
+    try:
+        deadline.remaining()
+        if choice.get('finish_reason')!='stop' or choice['message'].get('tool_calls'):raise ProviderFault('PROVIDER_COMPLETION_INCOMPLETE',{'violation':'completion_not_final'})
+        candidate(content)
+    except ProviderFault as e:
+        event.update(schema_status='REJECTED',schema_code=str(e),schema_error=e.detail);emit();raise
+    event.update(schema_status='ACCEPTED');emit()
+    return {'content':content,**event}
 
 class Adapter:
     """Durable identity + frozen generated task. Ambiguous generation never auto-replays."""

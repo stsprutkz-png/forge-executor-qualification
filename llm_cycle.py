@@ -178,20 +178,27 @@ def update_existing(root,image,received,acceptance):
     if len(text.encode())>8192 or SECRET.search(text):raise Fault('UPDATE_PROMPT_REJECTED')
     if not os.environ.get('DEEPSEEK_API_KEY'):raise Fault('DEEPSEEK_KEY_MISSING')
     (output/'sent-prompt.txt').write_text(text)
-    audit={'real_post_attempts':0,'max_post_attempts':1,'approved_budget_usd':0.01,'max_input_utf8_bytes':8192,'max_output_tokens':2048,'deadline_seconds':480,'input_bytes':len(text.encode()),'prompt_sha256':sha(text.encode()),'baseline_product_sha256':sha(baseline),'status':'NOT_SENT','started_utc':time.time()}
+    audit={'real_post_attempts':0,'max_post_attempts':1,'approved_budget_usd':0.01,'max_input_utf8_bytes':8192,'max_output_tokens':2048,'deadline_seconds':480,'input_bytes':len(text.encode()),'prompt_sha256':sha(text.encode()),'baseline_product_sha256':sha(baseline),'status':'NOT_SENT','http_status':'NOT_SENT','schema_status':'NOT_RUN','update_status':'NOT_APPLIED','started_utc':time.time()}
     def save(): (output/'update-api-audit.json').write_text(json.dumps(audit,indent=2))
     def timeout(*unused):raise Fault('GLOBAL_UPDATE_TIMEOUT')
     signal.signal(signal.SIGALRM,timeout);signal.alarm(480);save()
     try:
-        audit.update(real_post_attempts=1,status='OUTCOME_UNKNOWN');save()
-        response=http_complete('deepseek','deepseek-flash',text,Deadline(60),audit=lambda safe:audit.update(provider_receipt=safe))
-        audit.update(status='RESPONSE_ACCEPTED',response_utc=time.time());save()
+        audit.update(real_post_attempts=1,status='REQUEST_STARTED',http_status='REQUEST_STARTED');save()
+        def receive_event(event):
+            audit.update(provider_receipt=event,http_status=event.get('http_status'),schema_status=event.get('schema_status'),status=event.get('http_status'),schema_error=event.get('schema_error'));save()
+        response=http_complete('deepseek','deepseek-flash',text,Deadline(60),audit=receive_event,content_path=output/'raw-model-content.txt')
+        audit.update(status='SCHEMA_ACCEPTED',response_utc=time.time());save()
         (output/'model-response.json').write_text(response['content'])
-        files=candidate(response['content']);assert set(files)==set(baseline_files)
+        files=candidate(response['content']);
+        if set(files)!=set(baseline_files):
+            audit.update(schema_status='REJECTED',schema_error={'violation':'required_baseline_files','missing':sorted(set(baseline_files)-set(files))});save()
+            raise Fault('UPDATE_REQUIRED_FILES_MISSING')
         if files['summary.py'].encode()==baseline_files['summary.py']:raise Fault('NO_CODE_CHANGE')
         task=normalize({k:v for k,v in {**spec,'request':'Extend existing verified CSV product with category totals; preserve exact sums','files':files}.items() if k!='baseline_files'})
         (output/'update-task.json').write_bytes(canonical(task))
+        audit['update_status']='SUBMITTED';save()
         r=executor.submit(task)
+        audit['update_status']='APPLIED_VERIFIED' if r.get('status')=='VERIFIED_ARTIFACT' else 'APPLICATION_FAILED';save()
         result={'status':'UPDATE_CHECKED_ON_WORKER','qualification_pass':False,'project_id':spec['project_id'],'base_sha256':spec['base_sha256'],'task_sha256':sha(canonical(task)),'raw_model_sha256':sha(response['content'].encode()),'provider_receipt':{k:v for k,v in response.items() if k!='content'},'executor':{k:v for k,v in r.items() if k!='artifact_base64'},'provider_context':{n:os.environ.get(n) for n in ['GITHUB_RUN_ID','GITHUB_JOB','GITHUB_SHA','GITHUB_REPOSITORY']},'new_create_called':False}
         (output/'update-evidence.json').write_text(json.dumps(result,indent=2))
         if r.get('status')!='VERIFIED_ARTIFACT':raise Fault('UPDATE_BEHAVIOR_FAILED')
@@ -202,7 +209,9 @@ def update_existing(root,image,received,acceptance):
         result.update(product_sha256=sha(data),executor_reused=True,fetched_twice_equal=True)
         (output/'update-evidence.json').write_text(json.dumps(result,indent=2));return result
     except Fault as e:
-        audit['terminal_reason']=str(e);raise
+        audit['terminal_reason']=str(e)
+        if hasattr(e,'detail'):audit['schema_error']=e.detail
+        raise
     finally:
         signal.alarm(0);audit['ended_utc']=time.time();save()
 

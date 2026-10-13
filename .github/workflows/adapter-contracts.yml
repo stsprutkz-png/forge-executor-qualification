@@ -1,15 +1,14 @@
-name: Pilot 3 authorized single existing-project UPDATE
+name: UPDATE diagnostic repair synthetic HTTP tests only
 on:
   push:
-    branches: [multimodel-pilot3-update]
+    branches: [multimodel-update-diagnostics]
 permissions:
   contents: read
   actions: read
 jobs:
-  update-worker:
-    environment: forge-api-pilot
+  diagnostic-contracts:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -19,91 +18,44 @@ jobs:
           name: repaired-create
           run-id: 38373418459
           github-token: ${{ github.token }}
-          path: received
+          path: baseline
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: repaired-create-controller
           run-id: 38373418459
           github-token: ${{ github.token }}
           path: acceptance
-      - name: Same isolated runtime without provider credentials
-        run: |
-          image_ref=$(python3 -c 'import json; print(json.load(open("received/runtime-profile.json"))["image_reference"])')
-          bash setup_rootless.sh "$image_ref"
-          mkdir -p result
-          cp runtime-profile.json result/
-      - name: One authorized UPDATE request; no CREATE and no retries
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: updated-product
+          run-id: 38375079359
+          github-token: ${{ github.token }}
+          path: failed-update
+      - name: Synthetic-only tests, actual socket connections forbidden
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DIAGNOSTIC_BASELINE_DIR: baseline
+          DIAGNOSTIC_ACCEPTANCE_FILE: acceptance/delivery-controller.json
         run: |
-          image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
-          python3 llm_cycle.py --update-from received --acceptance-from acceptance/delivery-controller.json --root result --image "$image_id" > result/update.log 2>&1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: updated-product
-          path: result/
-          retention-days: 1
-          if-no-files-found: error
-  independent-lifecycle:
-    needs: update-worker
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: updated-product
-          path: received-one
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: updated-product
-          path: received-two
-      - name: Same isolated runtime on independent host
-        run: |
-          image_ref=$(python3 -c 'import json; print(json.load(open("received-one/runtime-profile.json"))["image_reference"])')
-          bash setup_rootless.sh "$image_ref"
-      - name: Independent before after behavior and final ZIP delivery
-        run: |
-          python3 - <<'PY'
-          import json,tempfile,sqlite3
+          python3 - <<'PY' > diagnostic-tests.log 2>&1
+          import json,unittest,socket,sqlite3,hashlib
           from pathlib import Path
-          from executor import Executor,sha
-          from isolation import PodmanBackend
-          from contracts import verify
-          from processes import Deadline
-          one=Path('received-one');two=Path('received-two')
-          metadata=json.loads((one/'update-evidence.json').read_text())
-          data=(one/'product.zip').read_bytes()
-          assert data==(two/'product.zip').read_bytes() and sha(data)==metadata['product_sha256']
-          image=json.loads(Path('runtime-profile.json').read_text())['image_id']
-          outcomes={}
-          with tempfile.TemporaryDirectory() as tmp:
-              backend=PodmanBackend(image,sha(tmp.encode()));executor=Executor(Path(tmp)/'state',backend)
-              deadline=Deadline(120);backend.begin('0'*64,deadline);isolation=backend.preflight(deadline)
-              for mode,archive,version,expected_sha in [('CREATE','baseline-product.zip','csv-v1',metadata['base_sha256']),('UPDATE','product.zip','csv-v2',metadata['product_sha256'])]:
-                  workspace=Path(tmp)/mode
-                  executor._write_files(workspace,executor._archive(one/archive,expected_sha))
-                  checks=verify(workspace,version,backend,deadline);assert checks['ok']
-                  outcomes[mode]=checks
-                  if mode=='UPDATE':
-                      raw=json.loads((one/'model-response.json').read_text())
-                      for name,source in raw['files'].items():assert (workspace/name).read_bytes()==source.encode()
-              before=outcomes['CREATE']['cases'][1]['actual'];after=outcomes['UPDATE']['cases'][1]['actual']
-              assert 'categories' not in before and after['categories']=={'A':'12.50','B':'-3'}
-              assert before['rows']==after['rows']==3 and before['total']==after['total']=='9.50'
-              for mode in ['CREATE','UPDATE']:assert outcomes[mode]['cases'][6]['actual']['total']=='123456789012345678901234567890.1'
-          db=sqlite3.connect('file:'+str((one/'state/state.sqlite3').resolve())+'?mode=ro',uri=True)
-          history=db.execute('SELECT task_id,phase FROM operations ORDER BY rowid').fetchall();db.close()
-          assert history==[('create-1','FAILED'),('create-1-repair-1','COMPLETE'),('update-1','COMPLETE')]
-          result={'status':'INDEPENDENT_LIFECYCLE_AND_DELIVERY_VERIFIED','provider_attested_externally':False,'checks':outcomes,'isolation':isolation,'functional_delta':{'before':before,'after':after},'history':history,'base_sha256':metadata['base_sha256'],'product_sha256':sha(data),'downloaded_twice_equal':True,'model_requests':0}
-          Path('delivery-controller.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+          from unittest.mock import patch
+          old=Path('failed-update/baseline-product.zip').read_bytes()
+          assert hashlib.sha256(old).hexdigest()==hashlib.sha256(Path('baseline/product.zip').read_bytes()).hexdigest()=='634c9205351c84736e6af8b1d0c7301c239380d8014f39349f7d6d36db5aa17d'
+          db=sqlite3.connect('file:failed-update/state/state.sqlite3?mode=ro',uri=True)
+          assert db.execute('SELECT task_id,phase FROM operations ORDER BY rowid').fetchall()==[('create-1','FAILED'),('create-1-repair-1','COMPLETE')]
+          db.close()
+          suite=unittest.defaultTestLoader.loadTestsFromName('test_model_adapter.AuditDiagnosticsTests')
+          with patch('socket.create_connection',side_effect=AssertionError('REAL_NETWORK_FORBIDDEN')),patch('socket.socket.connect',side_effect=AssertionError('REAL_NETWORK_FORBIDDEN')):
+              result=unittest.TextTestRunner(verbosity=2).run(suite)
+          Path('diagnostic-result.json').write_text(json.dumps({'status':'DIAGNOSTIC_REPAIR_PASS' if result.wasSuccessful() else 'FAIL','tests':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),'paid_model_requests':0,'http_responses':'explicit synthetic doubles','baseline_head_unchanged':True,'full_lifecycle_pass':False},indent=2))
+          raise SystemExit(0 if result.wasSuccessful() else 2)
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: lifecycle-controller
-          path: delivery-controller.json
+          name: update-diagnostic-evidence
+          path: |
+            diagnostic-tests.log
+            diagnostic-result.json
           retention-days: 1

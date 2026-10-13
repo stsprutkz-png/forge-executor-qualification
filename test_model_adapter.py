@@ -86,3 +86,133 @@ class Tests(unittest.TestCase):
             with self.assertRaisesRegex(ProviderFault,'SECRET'):http_complete('openrouter','test','synthetic',Deadline(1))
 
 if __name__=='__main__':unittest.main()
+
+class AuditDiagnosticsTests(unittest.TestCase):
+    def invoke(self,content,path,events,finish='stop',transport=None,usage=None):
+        from model_adapter import http_complete
+        from processes import Deadline
+        import json,os
+        from unittest.mock import patch
+        class Response:
+            status=200
+            def __enter__(self):return self
+            def __exit__(self,*a):pass
+            def read(self,*a):return json.dumps({'id':'synthetic-response','model':'deepseek-flash','usage':({'prompt_tokens':7,'completion_tokens':11} if usage is None else usage),'choices':[{'finish_reason':finish,'message':{'content':content}}]}).encode()
+        class Fake:
+            def open(self,*a,**kw):return Response()
+        with patch.dict(os.environ,{'DEEPSEEK_API_KEY':'SYNTHETIC_LOCAL_SECRET_VALUE','OPENROUTER_API_KEY':'OTHER_LOCAL_SECRET_VALUE'}),patch('urllib.request.build_opener',return_value=Fake()):
+            return (transport or http_complete)('deepseek','deepseek-flash','synthetic',Deadline(30),events.append,content_path=path)
+    def test_valid_snapshot_and_status_order(self):
+        from pathlib import Path
+        import tempfile,json
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'raw.txt';events=[]
+            r=self.invoke(json.dumps({'files':{'summary.py':'# synthetic','README.md':'usage'}}),path,events)
+            self.assertEqual(r['schema_status'],'ACCEPTED');self.assertTrue(path.exists())
+            self.assertEqual(events[0]['http_status'],'RESPONSE_RECEIVED');self.assertEqual(events[0]['schema_status'],'NOT_RUN')
+            self.assertEqual(events[-2]['content_snapshot']['saved_sha256'],__import__('hashlib').sha256(path.read_bytes()).hexdigest())
+    def test_specific_schema_errors_saved_before_rejection(self):
+        import tempfile,json
+        from pathlib import Path
+        from model_adapter import ProviderFault
+        cases=[('{','json_syntax'),('[]','root_type'),('{"summary.py":"source"}','root_keys'),('{"files":[]}','files_type'),('{"files":{"README.md":"usage"}}','missing_required_files'),('{"files":{"summary.py":9}}','file_content_type'),('{"files":{"summary.py":"x","evil.py":"x"}}','files_outside_contract'),('{"files":{},"files":{}}','duplicate_key'),('{"files":NaN}','nonfinite_json_constant')]
+        for content,reason in cases:
+            with self.subTest(reason=reason),tempfile.TemporaryDirectory() as tmp:
+                path=Path(tmp)/'raw.txt';events=[]
+                with self.assertRaises(ProviderFault) as got:self.invoke(content,path,events)
+                self.assertEqual(got.exception.detail['violation'],reason);self.assertEqual(path.read_text(),content)
+                self.assertEqual(events[-1]['http_status'],'RESPONSE_RECEIVED');self.assertEqual(events[-1]['schema_status'],'REJECTED')
+                self.assertEqual(events[-1]['schema_error']['violation'],reason)
+    def test_redaction_and_utf8_size_limit(self):
+        import tempfile,json
+        from pathlib import Path
+        from model_adapter import ProviderFault
+        secret='SYNTHETIC_LOCAL_SECRET_VALUE';other='OTHER_LOCAL_SECRET_VALUE'
+        content=json.dumps({'files':{'summary.py':secret+' '+other+' '+'sk-'+'x'*40+'\n-----BEGIN PRIVATE KEY-----\nPRIVATE_BODY\n-----END PRIVATE KEY-----'}})
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'raw';events=[]
+            with self.assertRaises(ProviderFault):self.invoke(content,p,events)
+            saved=p.read_text();self.assertNotIn(secret,saved);self.assertNotIn(other,saved);self.assertNotIn('PRIVATE_BODY',saved);self.assertNotIn('sk-'+'x'*40,saved)
+            with self.assertRaises(ProviderFault):self.invoke('я'*40000,p,[])
+            self.assertLessEqual(p.stat().st_size,65536);p.read_text(encoding='utf-8')
+    def test_completion_rejection_retains_content(self):
+        import tempfile
+        from pathlib import Path
+        from model_adapter import ProviderFault
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'raw';events=[]
+            with self.assertRaisesRegex(ProviderFault,'COMPLETION_INCOMPLETE'):self.invoke('partial',p,events,finish='length')
+            self.assertEqual(p.read_text(),'partial');self.assertEqual(events[-1]['schema_error']['violation'],'completion_not_final')
+    def test_nonstring_content_records_type(self):
+        import tempfile
+        from pathlib import Path
+        from model_adapter import ProviderFault
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'raw';events=[]
+            with self.assertRaises(ProviderFault) as e:self.invoke(None,p,events)
+            self.assertEqual(e.exception.detail['actual_type'],'NoneType');self.assertEqual(p.read_text(),'null')
+    def test_snapshot_symlink_is_not_followed(self):
+        import tempfile
+        from pathlib import Path
+        from model_adapter import safe_content_snapshot
+        with tempfile.TemporaryDirectory() as tmp:
+            target=Path(tmp)/'target';target.write_text('untouched');link=Path(tmp)/'link';link.symlink_to(target)
+            with self.assertRaises(OSError):safe_content_snapshot(link,'untrusted')
+            self.assertEqual(target.read_text(),'untouched')
+    def test_update_rejection_keeps_repaired_head(self):
+        import tempfile,os,json,sqlite3,hashlib
+        from pathlib import Path
+        from unittest.mock import patch
+        from llm_cycle import update_existing
+        from model_adapter import ProviderFault
+        from processes import Fault
+        # Synthetic harness artifact contains failed/fixed history and no provider credentials.
+        base=Path(os.environ['DIAGNOSTIC_BASELINE_DIR']);acceptance=Path(os.environ['DIAGNOSTIC_ACCEPTANCE_FILE'])
+        profile=json.loads((base/'runtime-profile.json').read_text())
+        real=self.invoke
+        from model_adapter import http_complete as original_transport
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_http(provider,model,text,deadline,audit=None,content_path=None):
+                events=[]
+                try:return real('{"summary.py":"synthetic source outside files wrapper"}',content_path,events,transport=original_transport)
+                finally:
+                    for event in events:
+                        if audit:audit(event)
+            with patch('model_adapter.http_complete',side_effect=fake_http),patch('executor.Executor.submit',side_effect=AssertionError('must not apply')),patch('signal.signal'),patch('signal.alarm'),patch.dict(os.environ,{'DEEPSEEK_API_KEY':'SYNTHETIC_LOCAL_SECRET_VALUE'}):
+                with self.assertRaisesRegex(ProviderFault,'MODEL_SCHEMA_INVALID'):update_existing(tmp,profile['image_id'],base,acceptance)
+            p=Path(tmp);audit=json.loads((p/'update-api-audit.json').read_text())
+            self.assertEqual(audit['http_status'],'RESPONSE_RECEIVED');self.assertEqual(audit['schema_status'],'REJECTED');self.assertEqual(audit['update_status'],'NOT_APPLIED')
+            self.assertEqual(audit['schema_error']['violation'],'root_keys');self.assertNotEqual(audit['status'],'OUTCOME_UNKNOWN')
+            self.assertTrue((p/'raw-model-content.txt').exists())
+            db=sqlite3.connect(p/'state/state.sqlite3');self.assertEqual(db.execute('SELECT task_id,phase FROM operations ORDER BY rowid').fetchall(),[('create-1','FAILED'),('create-1-repair-1','COMPLETE')]);self.assertEqual(db.execute('SELECT sha256 FROM projects').fetchone()[0],'634c9205351c84736e6af8b1d0c7301c239380d8014f39349f7d6d36db5aa17d');db.close()
+    def test_http_error_is_confirmed_response(self):
+        import urllib.error,tempfile,os
+        from pathlib import Path
+        from unittest.mock import patch
+        from model_adapter import http_complete,ProviderFault
+        from processes import Deadline
+        class Fake:
+            def open(self,*a,**kw):raise urllib.error.HTTPError('synthetic',429,'limited',{},None)
+        events=[]
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'DEEPSEEK_API_KEY':'SYNTHETIC_LOCAL_SECRET_VALUE'}),patch('urllib.request.build_opener',return_value=Fake()):
+            with self.assertRaisesRegex(ProviderFault,'HTTP_429'):http_complete('deepseek','deepseek-flash','synthetic',Deadline(30),events.append,Path(tmp)/'raw')
+        self.assertEqual(events[-1]['http_status'],'RESPONSE_RECEIVED');self.assertEqual(events[-1]['http_code'],429);self.assertEqual(events[-1]['schema_status'],'NOT_RUN')
+    def test_no_response_remains_unknown(self):
+        import urllib.error,os
+        from unittest.mock import patch
+        from model_adapter import http_complete,ProviderFault
+        from processes import Deadline
+        class Fake:
+            def open(self,*a,**kw):raise urllib.error.URLError('synthetic timeout')
+        events=[]
+        with patch.dict(os.environ,{'DEEPSEEK_API_KEY':'SYNTHETIC_LOCAL_SECRET_VALUE'}),patch('urllib.request.build_opener',return_value=Fake()):
+            with self.assertRaisesRegex(ProviderFault,'OUTCOME_UNKNOWN'):http_complete('deepseek','deepseek-flash','synthetic',Deadline(30),events.append)
+        self.assertEqual(events[-1]['http_status'],'OUTCOME_UNKNOWN');self.assertEqual(events[-1]['schema_status'],'NOT_RUN')
+    def test_raw_capture_survives_malformed_usage_metadata(self):
+        import tempfile,json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'raw';events=[]
+            content=json.dumps({'files':{'summary.py':'# synthetic'}})
+            result=self.invoke(content,p,events,usage=['wrong type'])
+            self.assertEqual(result['usage'],{});self.assertEqual(p.read_text(),content)
