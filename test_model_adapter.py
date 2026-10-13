@@ -301,7 +301,7 @@ def run_offline_type_experiment(received,output,image):
             backend=PodmanBackend(image,sha(tmp.encode()));executor=Executor(Path(tmp)/'diagnostic-state',backend)
             deadline=Deadline(120);backend.begin('0'*64,deadline);isolation=backend.preflight(deadline)
             baseline=Path(tmp)/'baseline';executor._write_files(baseline,executor._archive(received/'baseline-product.zip','634c9205351c84736e6af8b1d0c7301c239380d8014f39349f7d6d36db5aa17d'))
-            candidate_dir=Path(tmp)/'candidate';executor._write_files(candidate_dir,files)
+            candidate_dir=Path(tmp)/'candidate';executor._write_files(candidate_dir,{name:source.encode('utf-8') for name,source in files.items()})
             checks['baseline']=verify(baseline,'csv-v1',backend,deadline)
             checks['experimental_candidate']=verify(candidate_dir,'csv-v2',backend,deadline)
             assert (candidate_dir/'summary.py').read_bytes()==original['files']['summary.py'].encode()
