@@ -57,13 +57,16 @@ def prompt(spec):
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args):return None
 
-def http_complete(provider,model,text,deadline):
+def http_complete(provider,model,text,deadline,audit=None):
     if provider not in ENDPOINTS or not isinstance(model,str) or not model.strip():raise ProviderFault('PROVIDER_CONFIG_INVALID')
     url,env=ENDPOINTS[provider];key=os.environ.get(env)
     if not key:raise ProviderFault('PROVIDER_CREDENTIAL_MISSING')
     if key in text:raise ProviderFault('PROMPT_SECRET_REJECTED')
     body={'model':model,'messages':[{'role':'user','content':text}],'max_tokens':2048,
           'stream':False,'response_format':{'type':'json_object'}}
+    if len(text.encode())>8192:raise ProviderFault('PROVIDER_INPUT_LIMIT')
+    if provider=='deepseek':body['thinking']={'type':'disabled'}
+    if provider=='openrouter':body['provider']={'require_parameters':True,'allow_fallbacks':False}
     request=urllib.request.Request(url,data=canonical(body),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},method='POST')
     started=time.monotonic()
     try:
@@ -75,15 +78,17 @@ def http_complete(provider,model,text,deadline):
     if len(raw)>262144:raise ProviderFault('PROVIDER_RESPONSE_LIMIT')
     try:
         v=json.loads(raw);choice=v['choices'][0]
-        if choice['finish_reason']!='stop' or choice['message'].get('tool_calls'):raise ProviderFault('PROVIDER_COMPLETION_INCOMPLETE')
         content=choice['message']['content'];usage=v.get('usage',{})
         if key in content:raise ProviderFault('MODEL_SECRET_REJECTED')
-        candidate(content)
     except (KeyError,TypeError,ValueError,IndexError):raise ProviderFault('PROVIDER_RESPONSE_INVALID') from None
     # Whitelist metadata; never persist headers, arbitrary error bodies or reasoning.
     response_id=str(v.get('id',''))[:200];returned_model=str(v.get('model',model))[:200]
     if any(key in x or SECRET.search(x) for x in [response_id,returned_model]):raise ProviderFault('MODEL_SECRET_REJECTED')
     safe_usage={k:x for k,x in usage.items() if k in ('prompt_tokens','completion_tokens','total_tokens','cost','prompt_cache_hit_tokens','prompt_cache_miss_tokens') and isinstance(x,(int,float)) and not isinstance(x,bool) and math.isfinite(x) and x>=0}
+    safe={'response_id':response_id,'provider':provider,'model':returned_model,'usage':safe_usage,'elapsed_seconds':time.monotonic()-started,'provenance':'LIVE_PROVIDER_API','cost_usd_observed':safe_usage.get('cost') if provider=='openrouter' else None}
+    if audit:audit(safe)
+    if choice['finish_reason']!='stop' or choice['message'].get('tool_calls'):raise ProviderFault('PROVIDER_COMPLETION_INCOMPLETE')
+    candidate(content)
     return {'content':content,'response_id':response_id,'provider':provider,'model':returned_model,
             'usage':safe_usage,'elapsed_seconds':time.monotonic()-started,'provenance':'LIVE_PROVIDER_API',
             'cost_usd_observed':safe_usage.get('cost') if provider=='openrouter' else None}

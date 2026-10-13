@@ -1,32 +1,83 @@
-name: API pilot credential preflight (no provider requests)
+name: Single authorized live API pilot
 on:
   push:
     branches: [multimodel-stage1]
-  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: forge-single-api-pilot
+  cancel-in-progress: false
 jobs:
-  credential-preflight:
+  worker:
     if: github.repository == 'stsprutkz-png/forge-executor-qualification' && !github.event.repository.private
     environment: forge-api-pilot
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 12
     steps:
-      - name: Check secret presence only; no API requests
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Secret presence, no values and no requests
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           python3 - <<'PY'
-          import json,os,pathlib
+          import os,json
           presence={n:bool(os.environ.get(n)) for n in ('DEEPSEEK_API_KEY','OPENROUTER_API_KEY')}
-          result={'environment':'forge-api-pilot','credentials_present':presence,'model_requests':0,'api_cost_generated_usd':0,'status':'CREDENTIALS_PRESENT_UNVALIDATED' if all(presence.values()) else 'BLOCKED_CREDENTIALS_MISSING'}
-          pathlib.Path('preflight.json').write_text(json.dumps(result,indent=2))
-          print(json.dumps(result))
+          print(json.dumps(presence))
+          assert all(presence.values()), 'CREDENTIALS_MISSING'
           PY
+      - name: Prepare isolated runtime without model credentials
+        run: bash setup_rootless.sh
+      - name: Handoff; execution continues without ChatGPT
+        run: |
+          mkdir -p result
+          date -u +%FT%TZ > result/handoff.txt
+          echo "Independent hosted execution; 60 second handoff before model calls"
+          sleep 60
+      - name: One live CREATE UPDATE cycle; no retry loop
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
+          cp runtime-profile.json result/
+          python3 llm_cycle.py --models models.example.json --root result --image "$image_id" > result/cycle.log 2>&1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
         with:
-          name: api-credential-preflight
-          path: preflight.json
+          name: executor-result
+          path: result/
           retention-days: 1
           if-no-files-found: error
+  controller:
+    needs: worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: executor-result
+          path: received-one
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: executor-result
+          path: received-two
+      - name: Independent rootless acceptance and delivery
+        run: |
+          image_ref=$(python3 -c 'import json; print(json.load(open("received-one/runtime-profile.json"))["image_reference"])')
+          bash setup_rootless.sh "$image_ref"
+          image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
+          python3 verify_delivery.py --image "$image_id" --first received-one --second received-two > controller.log 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: controller-evidence
+          path: |
+            controller.log
+            received-one/delivery-controller.json
+          retention-days: 1
