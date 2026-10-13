@@ -1,7 +1,6 @@
 name: Pilot 3 final single UPDATE with repaired diagnostics
 on:
-  push:
-    branches: [multimodel-update-final]
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read
