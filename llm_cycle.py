@@ -93,6 +93,68 @@ def cycle(root,image,models):
         signal.alarm(0);save_audit()
 
 
+def repair(root,image,failed,feedback):
+    import sqlite3,shutil,signal
+    from executor import canonical,normalize
+    from model_adapter import http_complete,candidate,SECRET,prompt
+    from contracts import CASES
+    output=Path(root).resolve();output.mkdir(parents=True,exist_ok=True)
+    failed=Path(failed);feedback=json.loads(Path(feedback).read_text())
+    db=sqlite3.connect('file:'+str((failed/'controller-private/adapter.sqlite3').resolve())+'?mode=ro',uri=True)
+    old=json.loads(db.execute("SELECT result FROM jobs WHERE project='llm-csv-pilot' AND taskid='create-1' AND phase='PREPARED'").fetchone()[0]);db.close()
+    original=old['raw_model_content'];original_sha=sha(original.encode())
+    if original_sha!='e7dae265cb404b1921c66c4497e5c33b53afc3da27e5fa5082c88f335975622c' or feedback['raw_model_sha256']!=original_sha:raise Fault('REPAIR_ORIGIN_MISMATCH')
+    assert feedback['expected']['total']=='123456789012345678901234567890.1' and feedback['actual']['total']=='123456789012345678901234567900'
+    if not os.environ.get('DEEPSEEK_API_KEY'):raise Fault('DEEPSEEK_KEY_MISSING')
+    text=('Repair the EXISTING failed implementation below; this is the same project, not a new CREATE from scratch. '
+          'Determine the cause yourself using the independent behavioral feedback and correct the existing code, preserving every other requirement. '
+          'Unchanged contract: Python stdlib summary.py; python summary.py input.csv; UTF-8 BOM CSV with amount column; '
+          'JSON rows integer and exact Decimal total string, preserving scale (0.1+0.2=0.3; 10-3+2.50=9.50); support numbers exceeding 28 digits without rounding. '
+          'Empty data rows=0,total="0". Invalid amount, NaN/Infinity, missing amount column or I/O error: exit2, empty stdout, stderr diagnostic. '
+          'No network, subprocesses, dependencies, credentials or PASS markers. '
+          'Return only one JSON object with key files, containing COMPLETE corrected executable summary.py and actual README.md. '
+          'No placeholder labels, fences or explanations.\nINDEPENDENT ORACLE INPUT:\n'+CASES[6][0]+
+          '\nEXPECTED:\n'+json.dumps(feedback['expected'])+'\nACTUAL:\n'+json.dumps(feedback['actual'])+
+          '\nEXISTING FAILED FILES:\n'+original)
+    if len(text.encode())>8192 or SECRET.search(text):raise Fault('REPAIR_PROMPT_REJECTED')
+    (output/'sent-prompt.txt').write_text(text)
+    audit={'real_post_attempts':0,'max_post_attempts':1,'max_input_utf8_bytes':8192,'max_output_tokens':2048,'deadline_seconds':480,'original_model_sha256':original_sha,'prompt_sha256':sha(text.encode()),'input_bytes':len(text.encode()),'provider':'deepseek','started_utc':time.time(),'status':'NOT_SENT'}
+    def save(): (output/'repair-api-audit.json').write_text(json.dumps(audit,indent=2))
+    save()
+    def timeout(*unused):raise Fault('GLOBAL_REPAIR_TIMEOUT')
+    signal.signal(signal.SIGALRM,timeout);signal.alarm(480)
+    try:
+        audit.update(real_post_attempts=1,status='OUTCOME_UNKNOWN');save()
+        response=http_complete('deepseek','deepseek-flash',text,Deadline(60),audit=lambda safe:audit.update(provider_receipt=safe))
+        audit.update(status='RESPONSE_ACCEPTED',ended_utc=time.time());save()
+        files=candidate(response['content']);assert set(files)==set(old['task']['files'])
+        (output/'model-response.json').write_text(response['content'])
+        state=output/'state';shutil.copytree(failed/'executor-state',state)
+        backend=PodmanBackend(image,sha(str(state).encode()));executor=Executor(state,backend)
+        assert executor.head(old['task']['project_id']) is None
+        # Preserve project and failed history; changed payload requires a distinct repair attempt identity.
+        task=normalize({**old['task'],'task_id':'create-1-repair-1','files':files})
+        (output/'repair-task.json').write_bytes(canonical(task))
+        r=executor.submit(task)
+        result={'status':'MODEL_REPAIR_CHECKED_ON_WORKER','qualification_pass':False,'original_task_sha256':sha(canonical(old['task'])),'original_model_sha256':original_sha,'repair_model_sha256':sha(response['content'].encode()),'repair_task_sha256':sha(canonical(task)),'provider_receipt':{k:v for k,v in response.items() if k!='content'},'executor':{k:v for k,v in r.items() if k!='artifact_base64'},'provider_context':{n:os.environ.get(n) for n in ['GITHUB_RUN_ID','GITHUB_JOB','GITHUB_SHA','GITHUB_REPOSITORY']},'update_called':False}
+        (output/'repair-evidence.json').write_text(json.dumps(result,indent=2))
+        if r.get('status')!='VERIFIED_ARTIFACT':raise Fault('REPAIRED_CREATE_BEHAVIOR_FAILED')
+        repeated=executor.submit(task);assert repeated['reused'] and repeated['sha256']==r['sha256']
+        a=executor.fetch(task['project_id'],r['operation_id']);b=executor.fetch(task['project_id'],r['operation_id'])
+        data=base64.b64decode(a['artifact_base64']);assert data==base64.b64decode(b['artifact_base64']) and sha(data)==r['sha256']
+        (output/'product.zip').write_bytes(data)
+        result.update(product_sha256=r['sha256'],executor_reused=True,fetched_twice_equal=True)
+        (output/'repair-evidence.json').write_text(json.dumps(result,indent=2))
+        # No UPDATE generation is authorized here. Prepare only the unchanged next contract.
+        spec={'project_id':task['project_id'],'task_id':'update-1','mode':'UPDATE','oracle_version':'csv-v2','deadline_seconds':120,'base_sha256':r['sha256'],'baseline_files':files}
+        update_prompt=prompt(spec)
+        (output/'update-plan.json').write_text(json.dumps({'status':'PENDING_INDEPENDENT_CREATE_ACCEPTANCE_AND_UPDATE_SPEND_AUTHORIZATION','spec':spec,'prompt_bytes':len(update_prompt.encode()),'additional_model_calls_required':1,'max_output_tokens':2048,'proposed_budget_usd':0.01,'requires_controller_pass':True},indent=2))
+        return result
+    except Fault as e:
+        audit['terminal_reason']=str(e);raise
+    finally:
+        signal.alarm(0);audit['ended_utc']=time.time();save()
+
 # Exact synthetic JSON code blocks copied from authenticated DeepSeek web UI.
 # Replaying these bytes is not an API call; external provenance must be checked.
 WEB_CAPTURES = {'CREATE': '{"files":{"summary.py":"import csv\\nimport sys\\nimport json\\nfrom decimal import Decimal, InvalidOperation, getcontext\\n\\n\\ndef main():\\n    if len(sys.argv) != 2:\\n        print(\\"Usage: python summary.py input.csv\\", file=sys.stderr)\\n        sys.exit(2)\\n\\n    path = sys.argv[1]\\n\\n    try:\\n        with open(path, \\"r\\", encoding=\\"utf-8-sig\\", newline=\\"\\") as f:\\n            reader = csv.DictReader(f)\\n            if reader.fieldnames is None:\\n                print(\\"Error: missing header\\", file=sys.stderr)\\n                sys.exit(2)\\n\\n            fieldnames = [name.strip() if name is not None else name for name in reader.fieldnames]\\n            if \\"amount\\" not in fieldnames:\\n                print(\\"Error: missing amount column\\", file=sys.stderr)\\n                sys.exit(2)\\n\\n            amount_index = fieldnames.index(\\"amount\\")\\n\\n            getcontext().prec = 1000000\\n            rows = 0\\n            total = Decimal(0)\\n\\n            for row in reader:\\n                if None in row:\\n                    print(\\"Error: invalid row\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                values = list(row.values())\\n                raw = values[amount_index]\\n                if raw is None:\\n                    print(\\"Error: missing amount value\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                text = raw.strip()\\n                if text == \\"\\":\\n                    print(\\"Error: empty amount value\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                try:\\n                    value = Decimal(text)\\n                except InvalidOperation:\\n                    print(\\"Error: invalid amount\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                if not value.is_finite():\\n                    print(\\"Error: non-finite amount\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                rows += 1\\n                total += value\\n\\n            if rows == 0:\\n                total = Decimal(0)\\n\\n            if rows == 0:\\n                total_str = \\"0\\"\\n            else:\\n                total_str = format(total, \\"f\\")\\n\\n            result = {\\"rows\\": rows, \\"total\\": total_str}\\n            sys.stdout.write(json.dumps(result, separators=(\\",\\", \\":\\")))\\n            sys.stdout.write(\\"\\\\n\\")\\n\\n    except OSError as e:\\n        print(f\\"Error: {e}\\", file=sys.stderr)\\n        sys.exit(2)\\n    except Exception as e:\\n        print(f\\"Error: {e}\\", file=sys.stderr)\\n        sys.exit(2)\\n\\n\\nif __name__ == \\"__main__\\":\\n    main()\\n","README.md":"Usage: python summary.py input.csv\\n\\nReads a UTF-8 BOM CSV file with an amount column and outputs one JSON object:\\n{\\"rows\\": <integer>, \\"total\\": \\"<exact decimal string>\\"}\\n\\n- Decimal scale is preserved: 0.1 + 0.2 = 0.3; 10 - 3 + 2.50 = 9.50.\\n- Numbers exceeding 28 digits are supported without rounding.\\n- Empty data yields {\\"rows\\":0,\\"total\\":\\"0\\"}.\\n- Invalid amount, NaN/Infinity, missing amount column, or I/O error exits with code 2, writes only to stderr, and produces no stdout.\\n- No networking, third-party dependencies, subprocesses, credentials, or PASS markers."}}', 'UPDATE': '{"files":{"summary.py":"import csv\\nimport sys\\nimport json\\nfrom decimal import Decimal, InvalidOperation, getcontext\\n\\n\\ndef main():\\n    if len(sys.argv) != 2:\\n        print(\\"Usage: python summary.py input.csv\\", file=sys.stderr)\\n        sys.exit(2)\\n\\n    path = sys.argv[1]\\n\\n    try:\\n        with open(path, \\"r\\", encoding=\\"utf-8-sig\\", newline=\\"\\") as f:\\n            reader = csv.DictReader(f)\\n            if reader.fieldnames is None:\\n                print(\\"Error: missing header\\", file=sys.stderr)\\n                sys.exit(2)\\n\\n            fieldnames = [name.strip() if name is not None else name for name in reader.fieldnames]\\n            if \\"amount\\" not in fieldnames:\\n                print(\\"Error: missing amount column\\", file=sys.stderr)\\n                sys.exit(2)\\n\\n            amount_index = fieldnames.index(\\"amount\\")\\n            category_index = fieldnames.index(\\"category\\") if \\"category\\" in fieldnames else None\\n\\n            getcontext().prec = 1000000\\n            rows = 0\\n            total = Decimal(0)\\n            categories = {}\\n\\n            for row in reader:\\n                if None in row:\\n                    print(\\"Error: invalid row\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                values = list(row.values())\\n                raw = values[amount_index]\\n                if raw is None:\\n                    print(\\"Error: missing amount value\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                text = raw.strip()\\n                if text == \\"\\":\\n                    print(\\"Error: empty amount value\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                try:\\n                    value = Decimal(text)\\n                except InvalidOperation:\\n                    print(\\"Error: invalid amount\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                if not value.is_finite():\\n                    print(\\"Error: non-finite amount\\", file=sys.stderr)\\n                    sys.exit(2)\\n\\n                if category_index is None:\\n                    category = \\"\\"\\n                else:\\n                    category_raw = values[category_index]\\n                    if category_raw is None:\\n                        category = \\"\\"\\n                    else:\\n                        category = category_raw.strip()\\n\\n                rows += 1\\n                total += value\\n\\n                if category not in categories:\\n                    categories[category] = Decimal(0)\\n                categories[category] += value\\n\\n            if rows == 0:\\n                total = Decimal(0)\\n\\n            if rows == 0:\\n                total_str = \\"0\\"\\n            else:\\n                total_str = format(total, \\"f\\")\\n\\n            categories_out = {}\\n            for key in sorted(categories.keys()):\\n                categories_out[key] = format(categories[key], \\"f\\")\\n\\n            result = {\\"rows\\": rows, \\"total\\": total_str, \\"categories\\": categories_out}\\n            sys.stdout.write(json.dumps(result, separators=(\\",\\", \\":\\")))\\n            sys.stdout.write(\\"\\\\n\\")\\n\\n    except OSError as e:\\n        print(f\\"Error: {e}\\", file=sys.stderr)\\n        sys.exit(2)\\n    except Exception as e:\\n        print(f\\"Error: {e}\\", file=sys.stderr)\\n        sys.exit(2)\\n\\n\\nif __name__ == \\"__main__\\":\\n    main()\\n","README.md":"Usage: python summary.py input.csv\\n\\nReads a UTF-8 BOM CSV file with an amount column and outputs one JSON object:\\n{\\"rows\\": <integer>, \\"total\\": \\"<exact decimal string>\\", \\"categories\\": {\\"<category>\\": \\"<exact decimal string>\\"}}\\n\\n- Decimal scale is preserved: 0.1 + 0.2 = 0.3; 10 - 3 + 2.50 = 9.50.\\n- Numbers exceeding 28 digits are supported without rounding.\\n- Categories are read from the category column, using the empty string if the column is absent or the value is empty.\\n- Category totals are exact Decimal strings and the categories mapping is sorted by category key.\\n- Empty data yields {\\"rows\\":0,\\"total\\":\\"0\\",\\"categories\\":{}}.\\n- Example: amount,category rows 10,A / -3,B / 2.50,A yields total=\\"9.50\\", rows=3, categories={\\"A\\":\\"12.50\\",\\"B\\":\\"-3\\"}.\\n- Invalid amount, NaN/Infinity, missing amount column, or I/O error exits with code 2, writes only to stderr, and produces no stdout.\\n- No networking, third-party dependencies, subprocesses, credentials, or PASS markers."}}'}
@@ -161,12 +223,13 @@ QWEN_WEB_CAPTURES = {'CREATE': '{\n  "files": {\n    "summary.py": "#!/usr/bin/e
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--root',required=True);p.add_argument('--image',required=True)
-    p.add_argument('--models');p.add_argument('--web-capture',action='store_true');p.add_argument('--qwen-capture',action='store_true');a=p.parse_args()
+    p.add_argument('--repair-from');p.add_argument('--feedback-from');p.add_argument('--models');p.add_argument('--web-capture',action='store_true');p.add_argument('--qwen-capture',action='store_true');a=p.parse_args()
     try:
-        if a.qwen_capture:r=web_capture_cycle(a.root,a.image,'qwen-web')
+        if a.repair_from:r=repair(a.root,a.image,a.repair_from,a.feedback_from)
+        elif a.qwen_capture:r=web_capture_cycle(a.root,a.image,'qwen-web')
         elif a.web_capture:r=web_capture_cycle(a.root,a.image)
         elif a.models:r=cycle(a.root,a.image,json.loads(Path(a.models).read_text()))
         else:raise Fault('MODELS_CONFIG_REQUIRED')
     except (Fault,ValueError,OSError) as e:r={'status':'FAILED','reason':str(e),'llm_cycle_pass':False}
     print(json.dumps({k:v for k,v in r.items() if k not in ['receipts','create','update']}))
-    raise SystemExit(0 if r['status'] in ('LIVE_MODEL_ISOLATED_CYCLE','CAPTURED_MODEL_ISOLATED_HOST_CYCLE') else 2)
+    raise SystemExit(0 if r['status'] in ('LIVE_MODEL_ISOLATED_CYCLE','CAPTURED_MODEL_ISOLATED_HOST_CYCLE','MODEL_REPAIR_CHECKED_ON_WORKER') else 2)
