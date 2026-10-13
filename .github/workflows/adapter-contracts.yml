@@ -1,6 +1,7 @@
-name: Single authorized live API pilot
+name: Authorized API pilot 2 DeepSeek primary
 on:
-  workflow_dispatch:
+  push:
+    branches: [multimodel-api-pilot2]
 permissions:
   contents: read
 concurrency:

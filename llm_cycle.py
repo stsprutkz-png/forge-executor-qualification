@@ -18,14 +18,31 @@ def cycle(root,image,models):
     if models!={'deepseek':'deepseek-flash','openrouter':'qwen/qwen3-coder'}:raise Fault('MODELS_CONFIG_INVALID')
     missing=[n for n,(_,env) in ENDPOINTS.items() if not os.environ.get(env)]
     if missing:return {'status':'BLOCKED','reason':'PROVIDER_CREDENTIAL_MISSING','providers':missing,'model_calls':0,'llm_cycle_pass':False}
-    calls=[];injections=[];current_mode=None;started=time.monotonic()
+    calls=[];injections=[];balance_checks=[];balance_delta=None;current_mode=None;started=time.monotonic()
     audit_path=output/'api-audit.json'
     def save_audit():
-        audit_path.write_text(json.dumps({'real_post_attempts':len(calls),'max_post_attempts':3,'max_input_utf8_bytes':8192,'input_token_budget_estimated_upper':8320,'max_output_tokens_per_post':2048,'global_deadline_seconds':480,'calls':calls,'controlled_injections':injections},indent=2))
+        audit_path.write_text(json.dumps({'real_post_attempts':len(calls),'max_post_attempts':3,'max_input_utf8_bytes':8192,'input_token_budget_estimated_upper':8320,'max_output_tokens_per_post':2048,'global_deadline_seconds':480,'calls':calls,'controlled_injections':injections,'balance_get_attempts':len(balance_checks),'balance_checks':balance_checks,'deepseek_account_balance_delta':balance_delta},indent=2))
+    def balance(stage):
+        import urllib.request,urllib.error
+        from decimal import Decimal
+        from model_adapter import NoRedirect
+        record={'stage':stage,'utc':time.time(),'status':'OUTCOME_UNKNOWN'};balance_checks.append(record)
+        try:
+            key=os.environ['DEEPSEEK_API_KEY']
+            req=urllib.request.Request('https://api.deepseek.com/user/balance',headers={'Authorization':'Bearer '+key},method='GET')
+            with urllib.request.build_opener(NoRedirect()).open(req,timeout=10) as response:
+                raw=response.read(65537)
+            if len(raw)>65536:raise ValueError('balance response too large')
+            value=json.loads(raw)
+            values={r['currency']:Decimal(r['total_balance']) for r in value['balance_infos'] if r['currency'] in ['USD','CNY']}
+            if not values or any(not v.is_finite() for v in values.values()):raise ValueError('invalid balance')
+            record['status']='OK';return values
+        except urllib.error.HTTPError as e:
+            record['status']='HTTP_'+str(e.code);return None
+        except (urllib.error.URLError,TimeoutError,OSError,ValueError,KeyError,TypeError):
+            record['status']='UNOBSERVED';return None
+        finally:save_audit()
     def transport(provider,model,text,deadline):
-        if current_mode=='UPDATE' and provider=='deepseek':
-            injections.append({'mode':'UPDATE','provider':'deepseek','status':'PROVIDER_CONTROLLED_REFUSAL','real_post':False,'utc':time.time()});save_audit()
-            raise ProviderFault('PROVIDER_CONTROLLED_REFUSAL')
         if len(calls)>=3:raise Fault('API_CALL_LIMIT')
         if len(text.encode())>8192:raise Fault('INPUT_LIMIT')
         for _,env in ENDPOINTS.values():
@@ -41,7 +58,9 @@ def cycle(root,image,models):
             record['ended_utc']=time.time();save_audit()
     def timeout(*unused):raise Fault('GLOBAL_CYCLE_TIMEOUT')
     signal.signal(signal.SIGALRM,timeout);signal.alarm(480)
+    before=balance('before')
     try:
+        if balance_checks[-1]['status']=='HTTP_401':raise Fault('DEEPSEEK_AUTH_FAILED_HTTP_401')
         adapter=Adapter(output/'controller-private',transport);state=output/'executor-state'
         backend=PodmanBackend(image,sha(str(state).encode()));executor=Executor(state,backend)
         receipts=[];c=None
@@ -54,7 +73,6 @@ def cycle(root,image,models):
             prepared=adapter.prepare(spec,[(n,models[n]) for n in ['deepseek','openrouter']])
             if 'task' not in prepared:return {**prepared,'llm_cycle_pass':False}
             if prepared['receipt'].get('provenance')!='LIVE_PROVIDER_API':raise Fault('REAL_API_PROVENANCE_REQUIRED')
-            if mode=='UPDATE':assert prepared['attempts']==[{'provider':'deepseek','model':models['deepseek'],'status':'PROVIDER_CONTROLLED_REFUSAL'}]
             r=executor.submit(prepared['task'])
             receipts.append({'mode':mode,'task_sha256':prepared['task_sha256'],'raw_model_sha256':prepared['raw_model_sha256'],'prompt_sha256':prepared['prompt_sha256'],'provider_receipt':prepared['receipt'],'attempts':prepared['attempts'],'executor':{k:v for k,v in r.items() if k!='artifact_base64'}})
             (output/'receipts.json').write_text(json.dumps(receipts,indent=2))
@@ -67,9 +85,11 @@ def cycle(root,image,models):
         data=base64.b64decode(a['artifact_base64']);assert data==base64.b64decode(b['artifact_base64']) and sha(data)==c['sha256']
         repeated=executor.submit(prepared['task']);assert repeated['reused'] and repeated['sha256']==c['sha256']
         (output/'product.zip').write_bytes(data)
-        result={'status':'LIVE_MODEL_ISOLATED_CYCLE','remote_provider_verified_externally':False,'llm_cycle_pass':False,'receipts':receipts,'downloaded_twice_equal':True,'update_reused':True,'adapter_restart_reused':True,'product_sha256':sha(data),'elapsed_seconds':time.monotonic()-started,'real_post_attempts':len(calls),'controlled_failover':True,'actual_provider_outage_observed':False,'provider_context':{n:os.environ.get(n) for n in ['GITHUB_RUN_ID','GITHUB_JOB','GITHUB_SHA','GITHUB_REPOSITORY']}}
+        result={'status':'LIVE_MODEL_ISOLATED_CYCLE','remote_provider_verified_externally':False,'llm_cycle_pass':False,'receipts':receipts,'downloaded_twice_equal':True,'update_reused':True,'adapter_restart_reused':True,'product_sha256':sha(data),'elapsed_seconds':time.monotonic()-started,'real_post_attempts':len(calls),'controlled_failover':False,'actual_provider_outage_observed':False,'provider_context':{n:os.environ.get(n) for n in ['GITHUB_RUN_ID','GITHUB_JOB','GITHUB_SHA','GITHUB_REPOSITORY']}}
         (output/'remote-cycle.json').write_text(json.dumps(result,indent=2));return result
     finally:
+        after=balance('after') if calls else None
+        if before is not None and after is not None and set(before)==set(after):balance_delta={n:str(before[n]-after[n]) for n in before}
         signal.alarm(0);save_audit()
 
 
