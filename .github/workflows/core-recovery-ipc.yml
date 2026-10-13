@@ -1,0 +1,59 @@
+name: Core Recovery IPC Transport
+on:
+  push:
+    branches: [core-recovery-ipc-20261013]
+    paths: [.github/workflows/core-recovery-ipc.yml]
+permissions:
+  contents: write
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Real forgev2 account and SO_PEERCRED
+        run: |
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin forgev2
+          sudo python3 - "$GITHUB_WORKSPACE/ipc-evidence.json" "$GITHUB_RUN_ID" "$GITHUB_SHA" <<'PY'
+          import socket,struct,pwd,os,json,tempfile,threading,subprocess,sys
+          from pathlib import Path
+          identity=pwd.getpwnam('forgev2')
+          results=[]
+          with tempfile.TemporaryDirectory(prefix='core-recovery-ipc-') as directory:
+              root=Path(directory);root.chmod(0o755);path=root/'control.sock'
+              server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+              server.bind(str(path));path.chmod(0o666);server.listen(2);server.settimeout(10)
+              def serve():
+                  for _ in range(2):
+                      connection,_=server.accept()
+                      with connection:
+                          pid,uid,gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,struct.calcsize('3i')))
+                          message=connection.recv(128).decode()
+                          accepted=uid==identity.pw_uid and message=='QUALIFY_READ_ONLY'
+                          response={'status':'PASS' if accepted else 'REJECTED','peer_pid':pid,'peer_uid':uid,'peer_gid':gid,'operation':message}
+                          results.append(response)
+                          connection.sendall(json.dumps(response).encode())
+              thread=threading.Thread(target=serve);thread.start()
+              client="import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(b'QUALIFY_READ_ONLY');print(s.recv(8192).decode())"
+              denied=subprocess.run([sys.executable,'-c',client,str(path)],capture_output=True,text=True,check=True,timeout=10)
+              allowed=subprocess.run([sys.executable,'-c',client,str(path)],user=identity.pw_uid,group=identity.pw_gid,capture_output=True,text=True,check=True,timeout=10)
+              thread.join(10);server.close()
+              assert not thread.is_alive()
+              denied=json.loads(denied.stdout);allowed=json.loads(allowed.stdout)
+              assert denied['status']=='REJECTED' and denied['peer_uid']==0
+              assert allowed['status']=='PASS' and allowed['peer_uid']==identity.pw_uid and allowed['peer_gid']==identity.pw_gid
+              evidence={'status':'PASS','scope':'real kernel SO_PEERCRED transport; not Core worker lifecycle','nss_stub':False,'forgev2':{'uid':identity.pw_uid,'gid':identity.pw_gid},'denied':denied,'allowed':allowed,'run_id':int(sys.argv[2]),'workflow_sha':sys.argv[3]}
+              Path(sys.argv[1]).write_text(json.dumps(evidence,indent=2))
+              print(json.dumps(evidence))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-recovery-ipc-evidence
+          path: ipc-evidence.json
+      - name: Record evidence on isolated branch
+        run: |
+          git config user.name "Forge Recovery Qualification"
+          git config user.email "recovery@localhost"
+          git add ipc-evidence.json
+          git commit -m "Record actual SO_PEERCRED qualification [skip ci]"
+          git push origin HEAD:"$GITHUB_REF_NAME"
