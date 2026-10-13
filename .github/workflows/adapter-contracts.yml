@@ -1,57 +1,12 @@
-name: Authorized API pilot 2 DeepSeek primary
+name: Pilot 2 failure diagnosis no model API calls
 on:
-  workflow_dispatch:
+  push:
+    branches: [multimodel-api-pilot2]
 permissions:
   contents: read
-concurrency:
-  group: forge-single-api-pilot
-  cancel-in-progress: false
+  actions: read
 jobs:
-  worker:
-    if: github.repository == 'stsprutkz-png/forge-executor-qualification' && !github.event.repository.private
-    environment: forge-api-pilot
-    runs-on: ubuntu-24.04
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - name: Secret presence, no values and no requests
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          python3 - <<'PY'
-          import os,json
-          presence={n:bool(os.environ.get(n)) for n in ('DEEPSEEK_API_KEY','OPENROUTER_API_KEY')}
-          print(json.dumps(presence))
-          assert all(presence.values()), 'CREDENTIALS_MISSING'
-          PY
-      - name: Prepare isolated runtime without model credentials
-        run: bash setup_rootless.sh
-      - name: Handoff; execution continues without ChatGPT
-        run: |
-          mkdir -p result
-          date -u +%FT%TZ > result/handoff.txt
-          echo "Independent hosted execution; 60 second handoff before model calls"
-          sleep 60
-      - name: One live CREATE UPDATE cycle; no retry loop
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
-          cp runtime-profile.json result/
-          python3 llm_cycle.py --models models.example.json --root result --image "$image_id" > result/cycle.log 2>&1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: executor-result
-          path: result/
-          retention-days: 1
-          if-no-files-found: error
-  controller:
-    needs: worker
+  diagnose-one-fixture:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -61,22 +16,41 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: executor-result
-          path: received-one
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: executor-result
-          path: received-two
-      - name: Independent rootless acceptance and delivery
+          run-id: 38370767080
+          github-token: ${{ github.token }}
+          path: failed
+      - name: Rootless runtime without model credentials
+        run: bash setup_rootless.sh
+      - name: Reproduce only the failing large Decimal fixture
         run: |
-          image_ref=$(python3 -c 'import json; print(json.load(open("received-one/runtime-profile.json"))["image_reference"])')
-          bash setup_rootless.sh "$image_ref"
-          image_id=$(python3 -c 'import json; print(json.load(open("runtime-profile.json"))["image_id"])')
-          python3 verify_delivery.py --image "$image_id" --first received-one --second received-two > controller.log 2>&1
+          python3 - <<'PY'
+          import json,sqlite3,hashlib
+          from pathlib import Path
+          from executor import Executor,sha
+          from isolation import PodmanBackend
+          from contracts import CASES
+          from processes import Deadline
+          db=sqlite3.connect('file:failed/controller-private/adapter.sqlite3?mode=ro',uri=True)
+          saved=json.loads(db.execute('SELECT result FROM jobs').fetchone()[0]);db.close()
+          raw=saved['raw_model_content']
+          assert sha(raw.encode())=='e7dae265cb404b1921c66c4497e5c33b53afc3da27e5fa5082c88f335975622c'
+          profile=json.loads(Path('runtime-profile.json').read_text())
+          backend=PodmanBackend(profile['image_id'],sha(b'pilot2-diagnostic'))
+          executor=Executor('diagnostic-state',backend)
+          workspace=Path('diagnostic-candidate').resolve()
+          executor._write_files(workspace,{n:s.encode() for n,s in saved['task']['files'].items()})
+          deadline=Deadline(120);backend.begin('1'*64,deadline)
+          isolation=backend.preflight(deadline)
+          text,expected,_=CASES[6];(workspace/'input.csv').write_text(text)
+          run=backend.run(workspace,'summary.py','input.csv',deadline)
+          actual=json.loads(run['stdout'])
+          assert run['exit_code']==0 and actual['rows']==expected['rows'] and actual['total']!=expected['total']
+          result={'status':'EXPECTED_PRODUCT_FAILURE_REPRODUCED','qualification_pass':False,'model_requests':0,'fixture_index':6,'raw_model_sha256':sha(raw.encode()),'expected':expected,'actual':actual,'run':run,'isolation':isolation}
+          Path('diagnosis.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: controller-evidence
-          path: |
-            controller.log
-            received-one/delivery-controller.json
+          name: pilot2-failure-diagnosis
+          path: diagnosis.json
           retention-days: 1
