@@ -1,7 +1,6 @@
 name: Authorized recorded UPDATE and Products delivery
 on:
-  push:
-    branches: [multimodel-recorded-update]
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read
